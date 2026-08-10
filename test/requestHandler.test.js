@@ -138,6 +138,27 @@ test("_isEmptyUpstreamResponse: terminal STOP with thought text part is NOT empt
     };
     assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
 });
+
+test("_isEmptyUpstreamResponse: candidates:[] header frame is NOT empty (no terminal evidence)", () => {
+    const rh = makeHandler();
+    assert.strictEqual(rh._isEmptyUpstreamResponse({ candidates: [] }), false);
+    assert.strictEqual(rh._isEmptyUpstreamResponse({ candidates: [], usageMetadata: { promptTokenCount: 100 } }), false);
+});
+
+test("_isEmptyUpstreamResponse: choices:[] usage-only frame is NOT empty", () => {
+    const rh = makeHandler();
+    assert.strictEqual(rh._isEmptyUpstreamResponse({ choices: [] }), false);
+    assert.strictEqual(rh._isEmptyUpstreamResponse({ choices: [], usage: { prompt_tokens: 50 } }), false);
+});
+
+test("_isEmptyUpstreamResponse: blocked promptFeedback is NOT empty (pass through, no switch)", () => {
+    const rh = makeHandler();
+    const resp = {
+        candidates: [],
+        promptFeedback: { blockReason: "SAFETY" },
+    };
+    assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
+});
 test("_isEmptyUpstreamResponse: terminal STOP thinking-only with thoughtsTokenCount but no content is NOT empty", () => {
     const rh = makeHandler();
     const resp = {

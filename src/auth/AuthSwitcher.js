@@ -78,11 +78,10 @@ class AuthSwitcher {
 
             if (failedAuthIndex >= 0) {
                 const emptyCount = this._emptyJudgmentCounts.get(failedAuthIndex) || 0;
-                // Churn guard: when a context keeps being judged empty (detector false-positive or
-                // genuinely empty across accounts), don't dispose/recreate it on every switch. Only
-                // dispose once it has accumulated K consecutive empty judgments. Non-empty failures
-                // (emptyCount === 0) still dispose immediately as before.
-                if (emptyCount === 0 || emptyCount >= AuthSwitcher.EMPTY_DISPOSE_THRESHOLD) {
+                // Churn guard: dispose a context only after K consecutive empty-upstream judgments
+                // on it. Non-empty failures (429/403/5xx) never dispose — the context stays warm
+                // and the account recovers after cooldown, keeping switching instant.
+                if (emptyCount >= AuthSwitcher.EMPTY_DISPOSE_THRESHOLD) {
                     this.logger.info(`🗑️ [Auth] Disposing tainted context #${failedAuthIndex} on account switch/retry...`);
                     await this.browserManager.closeContext(failedAuthIndex).catch(err => {
                         this.logger.warn(`[Auth] Failed to close context #${failedAuthIndex}: ${err.message}`);

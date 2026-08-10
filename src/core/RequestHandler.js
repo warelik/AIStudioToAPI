@@ -1232,7 +1232,7 @@ class RequestHandler {
                             // completion_tokens=0 shows up here with judged_empty:false.
                             this._dumpUpstreamCorrelation("processOpenAIRequest:initialMessage", initialMessage.data, requestId, model, currentQueueAuthIndex);
                         }
-                        if (initialMessage && initialMessage.event_type !== "error" && this._isEmptyUpstreamResponse(initialMessage.data)) {
+                        if (initialMessage && initialMessage.event_type === "chunk" && this._isEmptyUpstreamResponse(initialMessage.data)) {
                             this.logger.warn(`[Request] Detected empty upstream response on account index ${currentQueueAuthIndex}. Preparing retry...`);
                             initialMessage = {
                                 event_type: "error",
@@ -3086,7 +3086,7 @@ class RequestHandler {
                     currentQueueAuthIndex
                 );
             }
-            if (headerMessage?.event_type !== "error" && this._isEmptyUpstreamResponse(headerMessage?.data)) {
+            if (headerMessage?.event_type === "chunk" && this._isEmptyUpstreamResponse(headerMessage?.data)) {
                 this.logger.warn(
                     `[Request] Gemini real stream detected empty upstream response on account index ${currentQueueAuthIndex}. Preparing retry...`
                 );
@@ -3434,8 +3434,9 @@ class RequestHandler {
         if (!obj) return true;
 
         if (obj.candidates && Array.isArray(obj.candidates)) {
+            if (obj.promptFeedback && obj.promptFeedback.blockReason) return false;
             const cand = obj.candidates[0];
-            if (!cand) return true;
+            if (!cand) return false;
             const parts = cand.content?.parts || [];
             const hasToolCalls = parts.some(p => p.functionCall && p.functionCall.name);
             const hasNonWhitespaceText = parts.some(p => typeof p.text === "string" && p.text.trim().length > 0);
@@ -3457,7 +3458,7 @@ class RequestHandler {
 
         if (obj.choices && Array.isArray(obj.choices)) {
             const choice = obj.choices[0];
-            if (!choice) return true;
+            if (!choice) return false;
             const msg = choice.message || choice.delta || {};
             const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
             const hasNonWhitespaceContent = typeof msg.content === "string" && msg.content.trim().length > 0;
