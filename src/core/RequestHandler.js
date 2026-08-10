@@ -2846,6 +2846,34 @@ class RequestHandler {
             try {
                 const googleResponse = JSON.parse(fullData);
                 this._logGeminiNativeResponseDebug(googleResponse, "pseudo-stream");
+
+                if (this._isEmptyUpstreamResponse(googleResponse)) {
+                    this._dumpUpstreamCorrelation(
+                        "gemini-native-pseudo-stream",
+                        googleResponse,
+                        proxyRequest.request_id,
+                        proxyRequest.model,
+                        this.currentAuthIndex
+                    );
+                    this.logger.warn(
+                        `⚠️ [Request] Upstream pseudo-stream response judged empty (request ${proxyRequest.request_id}); switching account and ending stream.`
+                    );
+                    this._handleRequestError(
+                        {
+                            message: "Empty upstream response (pseudo-stream)",
+                            reason: "empty_upstream_response",
+                        },
+                        res,
+                        proxyRequest.request_id
+                    );
+                    this.authSwitcher?.handleRequestFailureAndSwitch({
+                        status: 502,
+                        reason: "empty_upstream_response",
+                        message: "Empty upstream response (pseudo-stream)",
+                    }, null);
+                    return;
+                }
+
                 const candidate = googleResponse.candidates?.[0];
 
                 if (candidate && candidate.content && Array.isArray(candidate.content.parts)) {
@@ -3019,6 +3047,26 @@ class RequestHandler {
             );
             this._forwardRequest(proxyRequest, currentQueueAuthIndex);
             headerMessage = await currentQueue.dequeue();
+if (headerMessage?.event_type !== "error") {
+                this._dumpUpstreamCorrelation(
+                    "gemini-native-real-stream:header",
+                    headerMessage?.data,
+                    proxyRequest.request_id,
+                    proxyRequest.model,
+                    currentQueueAuthIndex
+                );
+            }
+            if (headerMessage?.event_type !== "error" && this._isEmptyUpstreamResponse(headerMessage?.data)) {
+                this.logger.warn(
+                    `[Request] Gemini real stream detected empty upstream response on account index ${currentQueueAuthIndex}. Preparing retry...`
+                );
+                headerMessage = {
+                    event_type: "error",
+                    status: 502,
+                    message: "Empty upstream completion (zero content, zero function calls)",
+                    reason: "empty_upstream_response",
+                };
+            }
 
             const headerStatus = Number(headerMessage?.status);
             if (
@@ -3231,11 +3279,31 @@ class RequestHandler {
             const fullBodyBuffer = Buffer.concat(chunks);
             let responseBodyBuffer = fullBodyBuffer;
 
+            let fullResponse = null;
             try {
-                const fullResponse = JSON.parse(responseBodyBuffer.toString());
+                fullResponse = JSON.parse(responseBodyBuffer.toString());
                 this._logGeminiNativeResponseDebug(fullResponse, "non-stream");
             } catch (e) {
                 // Ignore JSON parsing errors for finish reason
+            }
+            if (fullResponse && this._isEmptyUpstreamResponse(fullResponse)) {
+                this._dumpUpstreamCorrelation(
+                    "gemini-native-non-stream",
+                    responseBodyBuffer,
+                    proxyRequest.request_id,
+                    proxyRequest.model,
+                    this.currentAuthIndex
+                );
+                this.logger.warn(
+                    `⚠️ [Request] Upstream non-stream response judged empty (request ${proxyRequest.request_id}); switching account and returning 502.`
+                );
+                this.authSwitcher?.handleRequestFailureAndSwitch({
+                    status: 502,
+                    reason: "empty_upstream_response",
+                    message: "Empty upstream response (non-stream)",
+                }, null);
+                this._sendErrorResponse(res, 502, "Empty upstream response");
+                return;
             }
 
             if (proxyRequest.response_transform === "batchEmbedToEmbedContent") {

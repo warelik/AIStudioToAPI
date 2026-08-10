@@ -130,3 +130,19 @@ test("_isEmptyUpstreamResponse: whitespace text WITH completion tokens is NOT em
     };
     assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
 });
+test("_isEmptyUpstreamResponse: terminal STOP with thought text part is NOT empty (thought parts count as content)", () => {
+    const rh = makeHandler();
+    const resp = {
+        candidates: [{ content: { parts: [{ thought: true, text: "hmm" }] }, finishReason: "STOP" }],
+        usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 5 },
+    };
+    assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
+});
+test("_isEmptyUpstreamResponse: terminal STOP thinking-only with thoughtsTokenCount but no content is NOT empty", () => {
+    const rh = makeHandler();
+    const resp = {
+        candidates: [{ content: { parts: [{ thought: true }] }, finishReason: "STOP" }],
+        usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 3 },
+    };
+    assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
+});
