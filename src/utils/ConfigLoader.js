@@ -34,7 +34,7 @@ class ConfigLoader {
             forceWebSearch: false,
             host: "0.0.0.0",
             httpPort: 7860,
-            immediateSwitchStatusCodes: [429, 503],
+            immediateSwitchStatusCodes: [429, 502, 503, 403],
             maxContexts: 1,
             maxRetries: 3,
             retryDelay: 2000,

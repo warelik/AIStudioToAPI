@@ -10,6 +10,10 @@
  * Handles account switching logic including single/multi-account modes and fallback mechanisms
  */
 class AuthSwitcher {
+    // Dispose a context only after this many consecutive empty-upstream judgments on the SAME context.
+    // Prevents a hot dispose/recreate loop when every account is judged empty (e.g. detector false-positive).
+    static EMPTY_DISPOSE_THRESHOLD = 3;
+
     constructor(logger, config, authSource, browserManager) {
         this.logger = logger;
         this.config = config;
@@ -18,6 +22,8 @@ class AuthSwitcher {
         this.failureCount = 0;
         this.usageCount = 0;
         this.isSystemBusy = false;
+        // authIndex -> consecutive empty_upstream_response judgment count.
+        this._emptyJudgmentCounts = new Map();
     }
 
     get currentAuthIndex() {
@@ -64,6 +70,30 @@ class AuthSwitcher {
         this.isSystemBusy = true;
 
         try {
+            const failedAuthIndex = this.currentAuthIndex;
+            const currentCanonicalIndex =
+                failedAuthIndex >= 0
+                    ? this.authSource.getCanonicalIndex(failedAuthIndex)
+                    : -1;
+
+            if (failedAuthIndex >= 0) {
+                const emptyCount = this._emptyJudgmentCounts.get(failedAuthIndex) || 0;
+                // Churn guard: when a context keeps being judged empty (detector false-positive or
+                // genuinely empty across accounts), don't dispose/recreate it on every switch. Only
+                // dispose once it has accumulated K consecutive empty judgments. Non-empty failures
+                // (emptyCount === 0) still dispose immediately as before.
+                if (emptyCount === 0 || emptyCount >= AuthSwitcher.EMPTY_DISPOSE_THRESHOLD) {
+                    this.logger.info(`🗑️ [Auth] Disposing tainted context #${failedAuthIndex} on account switch/retry...`);
+                    await this.browserManager.closeContext(failedAuthIndex).catch(err => {
+                        this.logger.warn(`[Auth] Failed to close context #${failedAuthIndex}: ${err.message}`);
+                    });
+                    if (emptyCount > 0) this._emptyJudgmentCounts.delete(failedAuthIndex);
+                } else {
+                    this.logger.info(
+                        `🛡️ [Auth] Skipping context #${failedAuthIndex} disposal (${emptyCount}/${AuthSwitcher.EMPTY_DISPOSE_THRESHOLD} consecutive empty judgments) to avoid churn.`
+                    );
+                }
+            }
             // Single account mode
             if (available.length === 1) {
                 const singleIndex = available[0];
@@ -76,6 +106,7 @@ class AuthSwitcher {
 
                 try {
                     await this.browserManager.launchOrSwitchContext(singleIndex);
+                    this._emptyJudgmentCounts.delete(singleIndex);
                     this.resetCounters();
                     this.browserManager.rebalanceContextPool().catch(err => {
                         this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
@@ -92,10 +123,6 @@ class AuthSwitcher {
             }
 
             // Multi-account mode
-            const currentCanonicalIndex =
-                this.currentAuthIndex >= 0
-                    ? this.authSource.getCanonicalIndex(this.currentAuthIndex)
-                    : this.currentAuthIndex;
             const currentIndexInArray = available.indexOf(currentCanonicalIndex);
             const hasCurrentAccount = currentIndexInArray !== -1;
             const startIndex = hasCurrentAccount ? currentIndexInArray : 0;
@@ -129,6 +156,7 @@ class AuthSwitcher {
                     `🔄 [Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
                 );
 
+                const prevIdx = this.currentAuthIndex;
                 try {
                     // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
                     await this.browserManager.preCleanupForSwitch(accountIndex);
@@ -151,6 +179,9 @@ class AuthSwitcher {
                     return { failedAccounts, newIndex: accountIndex, success: true };
                 } catch (error) {
                     this.logger.error(`❌ [Auth] Account #${accountIndex} failed: ${error.message}`);
+                    if (this.browserManager.currentAuthIndex === accountIndex) {
+                        this.browserManager.currentAuthIndex = prevIdx;
+                    }
                     failedAccounts.push(accountIndex);
                 }
             }
@@ -255,7 +286,21 @@ class AuthSwitcher {
             );
         }
 
-        const isImmediateSwitch = this.config.immediateSwitchStatusCodes.includes(errorDetails.status);
+        const isImmediateSwitch =
+            this.config.immediateSwitchStatusCodes.includes(errorDetails.status) ||
+            errorDetails.status === 502 ||
+            errorDetails.reason === "empty_upstream_response";
+
+        // Track consecutive empty-upstream judgments per context so we don't dispose/recreate
+        // contexts in a hot loop when every account is judged empty. Reset on any non-empty failure.
+        if (errorDetails.reason === "empty_upstream_response") {
+            const idx = this.currentAuthIndex;
+            if (idx >= 0) {
+                this._emptyJudgmentCounts.set(idx, (this._emptyJudgmentCounts.get(idx) || 0) + 1);
+            }
+        } else {
+            this._emptyJudgmentCounts.clear();
+        }
         const isThresholdReached =
             this.config.failureThreshold > 0 && this.failureCount >= this.config.failureThreshold;
 
