@@ -146,3 +146,87 @@ test("_isEmptyUpstreamResponse: terminal STOP thinking-only with thoughtsTokenCo
     };
     assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
 });
+
+// ---- OpenAI Response API fake stream: terminal empty upstream routes to switch+retry ----
+test("Response API fake stream: empty upstream body is judged and routed to switch+retry, not forwarded", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    rh.config = { streamingMode: "fake", switchOnUses: 0, thinkingLevel: null, forceThinking: false };
+    rh.needsSwitchingAfterRequest = false;
+    rh.timeouts = { FAKE_STREAM: 100 };
+
+    let switched = false;
+    let errorSent = false;
+    let dumped = false;
+    let translated = false;
+
+    rh.authSwitcher = {
+        incrementUsageCount: () => 0,
+        handleRequestFailureAndSwitch: async () => { switched = true; },
+    };
+
+    // Empty upstream: the tail queue delivers a STREAM_END with no content data,
+    // so the accumulated fullBody stays empty and must be judged terminal-empty.
+    const fakeQueue = { dequeue: async () => ({ type: "STREAM_END" }) };
+
+    rh.connectionRegistry = {
+        createMessageQueue: () => fakeQueue,
+        removeMessageQueue: () => {},
+    };
+    rh._generateRequestId = () => "test-fake-empty";
+    rh._startTrackedRequest = () => {};
+    rh._setResponseApiFormat = (res, fmt) => { res.__responseApiFormat = fmt; };
+    rh._ensureBrowserBackedRequestReady = async () => true;
+    rh._setupClientDisconnectHandler = () => {};
+    rh._initializeProxyRequestAttempt = () => {};
+    rh._updateTrackedRequest = () => {};
+    rh._getUsageStatsService = () => null;
+    rh._executeRequestWithRetries = async () => ({ success: true, queue: fakeQueue });
+    rh._forwardRequest = async () => {};
+    rh._dumpUpstreamCorrelation = () => { dumped = true; };
+    rh._handleRequestError = () => { errorSent = true; };
+    rh._finalizeTrackedRequest = () => {};
+    rh._isResponseWritable = () => true;
+    rh._handleQueueTimeout = () => {};
+
+    // Must NOT be reached: an empty upstream must not translate into a client stream.
+    rh.formatConverter.translateGoogleToResponseAPIStream = () => { translated = true; };
+    // Translate the outgoing OpenAI Responses request into Gemini deterministically.
+    rh.formatConverter.translateOpenAIResponseToGoogle = () => ({
+        googleRequest: { contents: [{ role: "user", parts: [{ text: "hi" }] }] },
+        cleanModelName: "gemini-2.5-flash",
+        modelStreamingMode: null,
+    });
+
+    const res = {
+        headersSent: false,
+        writableEnded: false,
+        __responseApiSeq: null,
+        status: () => ({ set: () => {} }),
+        write: () => true,
+        end: () => { res.writableEnded = true; },
+    };
+    const req = {
+        body: { stream: true, input: "hi", model: "gpt-4o-mini" },
+        headers: {},
+        method: "POST",
+        url: "/v1/responses",
+        protocol: "http",
+    };
+
+    // The fake-stream keep-alive timer (12-18s) is left pending after the request finishes and
+    // would hold the test runner's event loop open. Replace long timers with an immediate no-op.
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) =>
+        ms >= 1000 ? realSetTimeout(() => {}, 0, ...args) : realSetTimeout(fn, ms, ...args);
+    try {
+        await rh.processOpenAIResponseRequest(req, res);
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+
+    assert.strictEqual(switched, true, "empty upstream fake stream must route to account switch + retry");
+    assert.strictEqual(errorSent, true, "empty upstream fake stream must send an error to the client");
+    assert.strictEqual(dumped, true, "empty upstream fake stream must write a correlation dump");
+    assert.strictEqual(translated, false, "empty upstream fake stream must not translate/send an empty stream to the client");
+});

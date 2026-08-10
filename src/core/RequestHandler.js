@@ -1854,6 +1854,36 @@ class RequestHandler {
                                     return;
                                 }
 
+                                // Terminal emptiness judgment for the OpenAI Response API fake stream path.
+                                // _isEmptyUpstreamResponse handles an empty or parseable-but-empty body and treats a
+                                // fragmented unparseable tail as not-conclusively-empty, so translation proceeds unchanged.
+                                if (this._isEmptyUpstreamResponse(fullBody)) {
+                                    this._dumpUpstreamCorrelation(
+                                        "openai-response-api-fake-stream",
+                                        fullBody,
+                                        requestId,
+                                        model,
+                                        this.currentAuthIndex
+                                    );
+                                    this.logger.warn(
+                                        `⚠️ [Request] Upstream fake-stream response judged empty (request ${requestId}); switching account and ending stream.`
+                                    );
+                                    this._handleRequestError(
+                                        {
+                                            message: "Empty upstream response (Response API fake stream)",
+                                            reason: "empty_upstream_response",
+                                        },
+                                        res,
+                                        requestId
+                                    );
+                                    this.authSwitcher?.handleRequestFailureAndSwitch({
+                                        status: 502,
+                                        reason: "empty_upstream_response",
+                                        message: "Empty upstream response (Response API fake stream)",
+                                    }, null);
+                                    return;
+                                }
+
                                 const streamState = {};
                                 streamState.responseDefaults = responseDefaults;
                                 const translatedChunk = this.formatConverter.translateGoogleToResponseAPIStream(
@@ -3047,7 +3077,7 @@ class RequestHandler {
             );
             this._forwardRequest(proxyRequest, currentQueueAuthIndex);
             headerMessage = await currentQueue.dequeue();
-if (headerMessage?.event_type !== "error") {
+            if (headerMessage?.event_type !== "error") {
                 this._dumpUpstreamCorrelation(
                     "gemini-native-real-stream:header",
                     headerMessage?.data,
