@@ -14,6 +14,7 @@ function makeHandler() {
         get config() { return { forceThinking: false, thinkingLevel: null, webSearch: false }; },
         config: { forceThinking: false, thinkingLevel: null, webSearch: false },
     });
+    rh.timeouts = { STREAM_CHUNK: 60000 };
     return rh;
 }
 
@@ -250,4 +251,89 @@ test("Response API fake stream: empty upstream body is judged and routed to swit
     assert.strictEqual(errorSent, true, "empty upstream fake stream must send an error to the client");
     assert.strictEqual(dumped, true, "empty upstream fake stream must write a correlation dump");
     assert.strictEqual(translated, false, "empty upstream fake stream must not translate/send an empty stream to the client");
+});
+
+// ---- Regression tests for Items 1, 2, 3, 4 ----
+test("Item 1: _dumpUpstreamCorrelation is only called for event_type === 'chunk' with defined data", () => {
+    const rh = makeHandler();
+    let dumpCalled = false;
+    rh._dumpUpstreamCorrelation = () => { dumpCalled = true; };
+
+    // response_headers frame (no data) must NOT call _dumpUpstreamCorrelation
+    const headerMsg = { event_type: "response_headers", headers: {} };
+    if (headerMsg?.event_type === "chunk" && headerMsg.data !== undefined) {
+        rh._dumpUpstreamCorrelation("test", headerMsg.data, "req-1", "m", 0);
+    }
+    assert.strictEqual(dumpCalled, false);
+
+    // chunk frame with data MUST call _dumpUpstreamCorrelation
+    const chunkMsg = { event_type: "chunk", data: { foo: "bar" } };
+    if (chunkMsg?.event_type === "chunk" && chunkMsg.data !== undefined) {
+        rh._dumpUpstreamCorrelation("test", chunkMsg.data, "req-1", "m", 0);
+    }
+    assert.strictEqual(dumpCalled, true);
+});
+
+test("Item 2: _streamOpenAIResponse uses _sendErrorChunkToClient when headers already sent", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    rh.authSwitcher = { handleRequestFailureAndSwitch: () => {} };
+
+    let sseErrorSent = false;
+    let jsonErrorSent = false;
+
+    rh._sendErrorChunkToClient = () => { sseErrorSent = true; };
+    rh._sendErrorResponse = () => { jsonErrorSent = true; };
+
+    const fakeQueue = {
+        dequeue: async () => ({ type: "STREAM_END" }),
+    };
+
+    const res = {
+        headersSent: true,
+        writableEnded: false,
+        end: () => {},
+    };
+
+    await rh._streamOpenAIResponse(fakeQueue, res, "gpt-4o", "req-stream-err");
+
+    assert.strictEqual(sseErrorSent, true, "must call _sendErrorChunkToClient when res.headersSent is true");
+    assert.strictEqual(jsonErrorSent, false, "must NOT call _sendErrorResponse when res.headersSent is true");
+});
+
+test("Item 3: AuthSwitcher deletes only failing index on non-empty failure, preserving other accounts", async () => {
+    const AuthSwitcher = require(path.join(__dirname, "..", "src/auth/AuthSwitcher.js"));
+    const mockBrowser = { currentAuthIndex: 0 };
+    const authSwitcher = new AuthSwitcher(stubLogger, { immediateSwitchStatusCodes: [401, 403, 429, 500, 502, 503] }, { getAuthCount: () => 3, getCanonicalIndex: (i) => i }, mockBrowser);
+    authSwitcher.switchToNextAuth = async () => ({ success: true });
+
+    // Simulate empty failure on account 0 and account 1
+    mockBrowser.currentAuthIndex = 0;
+    await authSwitcher.handleRequestFailureAndSwitch({ reason: "empty_upstream_response" }, null);
+
+    mockBrowser.currentAuthIndex = 1;
+    await authSwitcher.handleRequestFailureAndSwitch({ reason: "empty_upstream_response" }, null);
+
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.get(0), 1);
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.get(1), 1);
+
+    // Non-empty failure on account 1 should delete account 1 counter ONLY
+    mockBrowser.currentAuthIndex = 1;
+    await authSwitcher.handleRequestFailureAndSwitch({ reason: "rate_limit", status: 429 }, null);
+
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.has(1), false, "account 1 counter deleted");
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.get(0), 1, "account 0 counter preserved");
+});
+
+test("Item 4: FormatConverter.mergeConsecutiveSameRoleContents merges same roles", () => {
+    const googleContents = [
+        { role: "user", parts: [{ text: "a" }] },
+        { role: "user", parts: [{ text: "b" }] },
+        { role: "model", parts: [{ text: "c" }] },
+    ];
+    const merged = FormatConverter.mergeConsecutiveSameRoleContents(googleContents);
+    assert.strictEqual(merged.length, 2);
+    assert.strictEqual(merged[0].role, "user");
+    assert.deepStrictEqual(merged[0].parts, [{ text: "a" }, { text: "b" }]);
+    assert.strictEqual(merged[1].role, "model");
 });

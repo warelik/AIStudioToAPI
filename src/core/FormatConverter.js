@@ -832,14 +832,8 @@ class FormatConverter {
         flushToolParts();
 
         // Merge consecutive contents with the same role (Gemini API requires strict role alternation)
-        const mergedContents = [];
-        for (const c of googleContents) {
-            if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === c.role) {
-                mergedContents[mergedContents.length - 1].parts.push(...c.parts);
-            } else {
-                mergedContents.push(c);
-            }
-        }
+        // Merge consecutive contents with the same role (Gemini API requires strict role alternation).
+        const mergedContents = FormatConverter.mergeConsecutiveSameRoleContents(googleContents);
 
         // Build Google request
         const googleRequest = {
@@ -2453,14 +2447,7 @@ class FormatConverter {
         flushToolParts();
 
         // Merge consecutive contents with the same role (Gemini API requires strict role alternation).
-        const mergedContents = [];
-        for (const c of googleContents) {
-            if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === c.role) {
-                mergedContents[mergedContents.length - 1].parts.push(...c.parts);
-            } else {
-                mergedContents.push(c);
-            }
-        }
+        const mergedContents = FormatConverter.mergeConsecutiveSameRoleContents(googleContents);
 
         // Build Google request
         const googleRequest = {
@@ -3325,14 +3312,7 @@ class FormatConverter {
         }
 
         // Merge consecutive contents with the same role (Gemini API requires strict role alternation).
-        const mergedContents = [];
-        for (const c of googleContents) {
-            if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === c.role) {
-                mergedContents[mergedContents.length - 1].parts.push(...c.parts);
-            } else {
-                mergedContents.push(c);
-            }
-        }
+        const mergedContents = FormatConverter.mergeConsecutiveSameRoleContents(googleContents);
 
         // Build Google request
         const googleRequest = {
@@ -3608,6 +3588,18 @@ class FormatConverter {
         });
         this.logger.info("[Adapter] OpenAI Response API to Google translation complete.");
         return { cleanModelName, googleRequest, modelStreamingMode };
+    }
+    static mergeConsecutiveSameRoleContents(contents) {
+        if (!Array.isArray(contents)) return contents;
+        const mergedContents = [];
+        for (const c of contents) {
+            if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === c.role) {
+                mergedContents[mergedContents.length - 1].parts.push(...c.parts);
+            } else {
+                mergedContents.push(c);
+            }
+        }
+        return mergedContents;
     }
 }
 

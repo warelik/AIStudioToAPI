@@ -1226,7 +1226,7 @@ class RequestHandler {
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
-                        if (initialMessage && initialMessage.event_type !== "error") {
+                        if (initialMessage && initialMessage.event_type === "chunk" && initialMessage.data !== undefined) {
                             // Write a correlation dump for EVERY judged upstream response (empty AND
                             // non-empty) so leaks are visible: a non-empty judgment that still yields
                             // completion_tokens=0 shows up here with judged_empty:false.
@@ -2731,15 +2731,7 @@ class RequestHandler {
             this._dumpUpstreamCorrelation("non-stream", fullBody, requestId, model, this.currentAuthIndex);
             // Terminal emptiness judgment for the Claude non-stream path.
             if (this._isEmptyUpstreamResponse(googleResponse)) {
-                this.logger.warn(
-                    `⚠️ [Request] Upstream non-stream response judged empty (request ${requestId}); switching account and returning 502.`
-                );
-                this.authSwitcher?.handleRequestFailureAndSwitch({
-                    status: 502,
-                    reason: "empty_upstream_response",
-                    message: "Empty upstream response (non-stream)",
-                }, null);
-                this._sendErrorResponse(res, 502, "Empty upstream response");
+                this._handleEmptyNonStreamResponse(res, requestId);
                 return;
             }
             const claudeResponse = this.formatConverter.convertGoogleToClaudeNonStream(googleResponse, model);
@@ -3077,7 +3069,7 @@ class RequestHandler {
             );
             this._forwardRequest(proxyRequest, currentQueueAuthIndex);
             headerMessage = await currentQueue.dequeue();
-            if (headerMessage?.event_type !== "error") {
+            if (headerMessage?.event_type === "chunk" && headerMessage.data !== undefined) {
                 this._dumpUpstreamCorrelation(
                     "gemini-native-real-stream:header",
                     headerMessage?.data,
@@ -3324,15 +3316,7 @@ class RequestHandler {
                     proxyRequest.model,
                     this.currentAuthIndex
                 );
-                this.logger.warn(
-                    `⚠️ [Request] Upstream non-stream response judged empty (request ${proxyRequest.request_id}); switching account and returning 502.`
-                );
-                this.authSwitcher?.handleRequestFailureAndSwitch({
-                    status: 502,
-                    reason: "empty_upstream_response",
-                    message: "Empty upstream response (non-stream)",
-                }, null);
-                this._sendErrorResponse(res, 502, "Empty upstream response");
+                this._handleEmptyNonStreamResponse(res, proxyRequest.request_id);
                 return;
             }
 
@@ -3898,7 +3882,11 @@ class RequestHandler {
                             reason: "empty_upstream_response",
                             message: "Empty upstream response (stream)",
                         }, null);
-                        this._sendErrorResponse(res, 502, "Empty upstream response");
+                        if (res.headersSent) {
+                            this._sendErrorChunkToClient(res, "Empty upstream response", 502);
+                        } else {
+                            this._sendErrorResponse(res, 502, "Empty upstream response");
+                        }
                         break;
                     }
                     // Flush any trailing partial SSE payload before ending the stream.
@@ -4051,15 +4039,7 @@ class RequestHandler {
             this._dumpUpstreamCorrelation("non-stream", fullBody, requestId, model, this.currentAuthIndex);
             // Terminal emptiness judgment for the OpenAI Response API non-stream path.
             if (this._isEmptyUpstreamResponse(googleResponse)) {
-                this.logger.warn(
-                    `⚠️ [Request] Upstream non-stream response judged empty (request ${requestId}); switching account and returning 502.`
-                );
-                this.authSwitcher?.handleRequestFailureAndSwitch({
-                    status: 502,
-                    reason: "empty_upstream_response",
-                    message: "Empty upstream response (non-stream)",
-                }, null);
-                this._sendErrorResponse(res, 502, "Empty upstream response");
+                this._handleEmptyNonStreamResponse(res, requestId);
                 return;
             }
             const responseAPIResponse = this.formatConverter.convertGoogleToResponseAPINonStream(
@@ -4110,15 +4090,7 @@ class RequestHandler {
             // completed response — judge it now (whitespace-only/empty text with stop and ct=0 is
             // empty, exactly as the stream path judges). Never leak an empty completion to the client.
             if (this._isEmptyUpstreamResponse(googleResponse)) {
-                this.logger.warn(
-                    `⚠️ [Request] Upstream non-stream response judged empty (request ${requestId}); switching account and returning 502.`
-                );
-                this.authSwitcher?.handleRequestFailureAndSwitch({
-                    status: 502,
-                    reason: "empty_upstream_response",
-                    message: "Empty upstream response (non-stream)",
-                }, null);
-                this._sendErrorResponse(res, 502, "Empty upstream response");
+                this._handleEmptyNonStreamResponse(res, requestId);
                 return;
             }
             const openAIResponse = this.formatConverter.convertGoogleToOpenAINonStream(googleResponse, model);
@@ -4128,6 +4100,18 @@ class RequestHandler {
             this.logger.error(`❌ [Adapter] Failed to parse response for OpenAI: ${e.message}`);
             this._sendErrorResponse(res, 500, "Failed to parse backend response");
         }
+    }
+
+    _handleEmptyNonStreamResponse(res, requestId) {
+        this.logger.warn(
+            `⚠️ [Request] Upstream non-stream response judged empty (request ${requestId}); switching account and returning 502.`
+        );
+        this.authSwitcher?.handleRequestFailureAndSwitch({
+            status: 502,
+            reason: "empty_upstream_response",
+            message: "Empty upstream response (non-stream)",
+        }, null);
+        this._sendErrorResponse(res, 502, "Empty upstream response");
     }
 
     _setResponseHeaders(res, headerMessage, req) {

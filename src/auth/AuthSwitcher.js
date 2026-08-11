@@ -71,10 +71,11 @@ class AuthSwitcher {
 
         try {
             const failedAuthIndex = this.currentAuthIndex;
-            const currentCanonicalIndex =
+            const getCurrentCanonicalIndex = () => (
                 failedAuthIndex >= 0
                     ? this.authSource.getCanonicalIndex(failedAuthIndex)
-                    : -1;
+                    : -1
+            );
 
             if (failedAuthIndex >= 0) {
                 const emptyCount = this._emptyJudgmentCounts.get(failedAuthIndex) || 0;
@@ -122,7 +123,7 @@ class AuthSwitcher {
             }
 
             // Multi-account mode
-            const currentIndexInArray = available.indexOf(currentCanonicalIndex);
+            const currentIndexInArray = available.indexOf(getCurrentCanonicalIndex());
             const hasCurrentAccount = currentIndexInArray !== -1;
             const startIndex = hasCurrentAccount ? currentIndexInArray : 0;
             const originalStartAccount = hasCurrentAccount ? available[startIndex] : null;
@@ -292,13 +293,15 @@ class AuthSwitcher {
 
         // Track consecutive empty-upstream judgments per context so we don't dispose/recreate
         // contexts in a hot loop when every account is judged empty. Reset on any non-empty failure.
+        const idx = this.currentAuthIndex;
         if (errorDetails.reason === "empty_upstream_response") {
-            const idx = this.currentAuthIndex;
             if (idx >= 0) {
                 this._emptyJudgmentCounts.set(idx, (this._emptyJudgmentCounts.get(idx) || 0) + 1);
             }
         } else {
-            this._emptyJudgmentCounts.clear();
+            if (idx >= 0) {
+                this._emptyJudgmentCounts.delete(idx);
+            }
         }
         const isThresholdReached =
             this.config.failureThreshold > 0 && this.failureCount >= this.config.failureThreshold;
