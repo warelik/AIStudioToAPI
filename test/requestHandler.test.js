@@ -5,18 +5,111 @@ const path = require("path");
 
 const RequestHandler = require(path.join(__dirname, "..", "src/core/RequestHandler.js"));
 const FormatConverter = require(path.join(__dirname, "..", "src/core/FormatConverter.js"));
+const ConnectionRegistry = require(path.join(__dirname, "..", "src/core/ConnectionRegistry.js"));
 
-const stubLogger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+const stubLogger = { debug: () => {}, error: () => {}, info: () => {}, warn: () => {} };
 
 function makeHandler() {
     const rh = Object.create(RequestHandler.prototype);
     rh.formatConverter = new FormatConverter(stubLogger, {
-        get config() { return { forceThinking: false, thinkingLevel: null, webSearch: false }; },
-        config: { forceThinking: false, thinkingLevel: null, webSearch: false },
+        get config() {
+            return { forceThinking: false, thinkingLevel: null, webSearch: false };
+        },
     });
     rh.timeouts = { STREAM_CHUNK: 60000 };
     return rh;
 }
+
+test("_isEmptyUpstreamResponse: native Anthropic text and tool_use are not empty", () => {
+    const rh = makeHandler();
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({
+            content: [{ text: "hello", type: "text" }],
+            stop_reason: "end_turn",
+            usage: { output_tokens: 1 },
+        }),
+        false
+    );
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({
+            content: [{ input: {}, name: "ping", type: "tool_use" }],
+            stop_reason: "tool_use",
+            usage: { output_tokens: 1 },
+        }),
+        false
+    );
+});
+
+test("_isEmptyUpstreamResponse: unknown Anthropic content blocks fail safe as content", () => {
+    const rh = makeHandler();
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({
+            content: [{ payload: { value: "future-output" }, type: "future_block" }],
+            stop_reason: "end_turn",
+            usage: { output_tokens: 0 },
+        }),
+        false
+    );
+});
+
+test("_isEmptyUpstreamResponse: native Anthropic empty terminal response is empty", () => {
+    const rh = makeHandler();
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({
+            content: [{ text: "   ", type: "text" }],
+            stop_reason: "end_turn",
+            usage: { output_tokens: 0 },
+        }),
+        true
+    );
+    assert.strictEqual(rh._isEmptyUpstreamResponse({ content: [] }), false, "non-terminal headers stay pass-through");
+});
+
+test("_withFailureAuthIndex resolves the request account without reading mutable current account", () => {
+    const rh = makeHandler();
+    rh.connectionRegistry = {
+        getAuthIndexForRequest: requestId => (requestId === "req-source" ? 4 : null),
+    };
+    const details = rh._withFailureAuthIndex({ status: 429 }, "req-source");
+    assert.deepStrictEqual(details, { authIndex: 4, status: 429 });
+    const explicit = rh._withFailureAuthIndex({ status: 502 }, "missing", 7);
+    assert.deepStrictEqual(explicit, { authIndex: 7, status: 502 });
+});
+
+test("ConnectionRegistry routes each browser message with its source authIndex", () => {
+    const registry = Object.create(ConnectionRegistry.prototype);
+    const messages = [];
+    const queue = { close: () => {}, enqueue: message => messages.push(message) };
+    registry._routeMessage({ data: { text: "x" }, event_type: "chunk" }, queue, 3);
+    registry._routeMessage({ event_type: "stream_close" }, queue, 5);
+    assert.strictEqual(messages[0].authIndex, 3);
+    assert.deepStrictEqual(messages[1], { authIndex: 5, type: "STREAM_END" });
+});
+
+test("AuthSwitcher attributes concurrent failure counters to explicit source authIndex", async () => {
+    const AuthSwitcher = require(path.join(__dirname, "..", "src/auth/AuthSwitcher.js"));
+    const mockBrowser = { currentAuthIndex: 9 };
+    const authSwitcher = new AuthSwitcher(
+        stubLogger,
+        { immediateSwitchStatusCodes: [502] },
+        { getAuthCount: () => 10, getCanonicalIndex: i => i },
+        mockBrowser
+    );
+    let switchStartIndex;
+    let allowOriginalFallback;
+    authSwitcher.switchToNextAuth = async (failedAuthIndex, allowFallback) => {
+        switchStartIndex = failedAuthIndex;
+        allowOriginalFallback = allowFallback;
+        return { success: true };
+    };
+
+    await authSwitcher.handleRequestFailureAndSwitch({ authIndex: 2, reason: "empty_upstream_response" }, null);
+
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.get(2), 1);
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.has(9), false);
+    assert.strictEqual(switchStartIndex, 2);
+    assert.strictEqual(allowOriginalFallback, false);
+});
 
 // ---- _extractSseEvents ----
 test("_extractSseEvents splits events on LF blank line", () => {
@@ -88,10 +181,12 @@ test("_translateCompleteSseEvent translates a valid JSON event and trims trailin
 test("_isEmptyUpstreamResponse: pure tool call is NOT empty", () => {
     const rh = makeHandler();
     const resp = {
-        candidates: [{
-            content: { parts: [{ functionCall: { name: "get_weather", args: {} } }] },
-            finishReason: "STOP",
-        }],
+        candidates: [
+            {
+                content: { parts: [{ functionCall: { args: {}, name: "get_weather" } }] },
+                finishReason: "STOP",
+            },
+        ],
     };
     assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
 });
@@ -104,7 +199,7 @@ test("_isEmptyUpstreamResponse: text content is NOT empty", () => {
 
 test("_isEmptyUpstreamResponse: reasoning-only non-terminal chunk is NOT empty", () => {
     const rh = makeHandler();
-    const resp = { candidates: [{ content: { parts: [{ thought: true, text: "hmm" }] } }] };
+    const resp = { candidates: [{ content: { parts: [{ text: "hmm", thought: true }] } }] };
     assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
 });
 
@@ -134,7 +229,7 @@ test("_isEmptyUpstreamResponse: whitespace text WITH completion tokens is NOT em
 test("_isEmptyUpstreamResponse: terminal STOP with thought text part is NOT empty (thought parts count as content)", () => {
     const rh = makeHandler();
     const resp = {
-        candidates: [{ content: { parts: [{ thought: true, text: "hmm" }] }, finishReason: "STOP" }],
+        candidates: [{ content: { parts: [{ text: "hmm", thought: true }] }, finishReason: "STOP" }],
         usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 5 },
     };
     assert.strictEqual(rh._isEmptyUpstreamResponse(resp), false);
@@ -143,7 +238,10 @@ test("_isEmptyUpstreamResponse: terminal STOP with thought text part is NOT empt
 test("_isEmptyUpstreamResponse: candidates:[] header frame is NOT empty (no terminal evidence)", () => {
     const rh = makeHandler();
     assert.strictEqual(rh._isEmptyUpstreamResponse({ candidates: [] }), false);
-    assert.strictEqual(rh._isEmptyUpstreamResponse({ candidates: [], usageMetadata: { promptTokenCount: 100 } }), false);
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({ candidates: [], usageMetadata: { promptTokenCount: 100 } }),
+        false
+    );
 });
 
 test("_isEmptyUpstreamResponse: choices:[] usage-only frame is NOT empty", () => {
@@ -173,7 +271,7 @@ test("_isEmptyUpstreamResponse: terminal STOP thinking-only with thoughtsTokenCo
 test("Response API fake stream: empty upstream body is judged and routed to switch+retry, not forwarded", async () => {
     const rh = makeHandler();
     rh.logger = stubLogger;
-    rh.config = { streamingMode: "fake", switchOnUses: 0, thinkingLevel: null, forceThinking: false };
+    rh.config = { forceThinking: false, streamingMode: "fake", switchOnUses: 0, thinkingLevel: null };
     rh.needsSwitchingAfterRequest = false;
     rh.timeouts = { FAKE_STREAM: 100 };
 
@@ -183,8 +281,10 @@ test("Response API fake stream: empty upstream body is judged and routed to swit
     let translated = false;
 
     rh.authSwitcher = {
+        handleRequestFailureAndSwitch: async () => {
+            switched = true;
+        },
         incrementUsageCount: () => 0,
-        handleRequestFailureAndSwitch: async () => { switched = true; },
     };
 
     // Empty upstream: the tail queue delivers a STREAM_END with no content data,
@@ -197,43 +297,53 @@ test("Response API fake stream: empty upstream body is judged and routed to swit
     };
     rh._generateRequestId = () => "test-fake-empty";
     rh._startTrackedRequest = () => {};
-    rh._setResponseApiFormat = (res, fmt) => { res.__responseApiFormat = fmt; };
+    rh._setResponseApiFormat = (res, fmt) => {
+        res.__responseApiFormat = fmt;
+    };
     rh._ensureBrowserBackedRequestReady = async () => true;
     rh._setupClientDisconnectHandler = () => {};
     rh._initializeProxyRequestAttempt = () => {};
     rh._updateTrackedRequest = () => {};
     rh._getUsageStatsService = () => null;
-    rh._executeRequestWithRetries = async () => ({ success: true, queue: fakeQueue });
+    rh._executeRequestWithRetries = async () => ({ queue: fakeQueue, success: true });
     rh._forwardRequest = async () => {};
-    rh._dumpUpstreamCorrelation = () => { dumped = true; };
-    rh._handleRequestError = () => { errorSent = true; };
+    rh._dumpUpstreamCorrelation = () => {
+        dumped = true;
+    };
+    rh._handleRequestError = () => {
+        errorSent = true;
+    };
     rh._finalizeTrackedRequest = () => {};
     rh._isResponseWritable = () => true;
     rh._handleQueueTimeout = () => {};
 
     // Must NOT be reached: an empty upstream must not translate into a client stream.
-    rh.formatConverter.translateGoogleToResponseAPIStream = () => { translated = true; };
+    rh.formatConverter.translateGoogleToResponseAPIStream = () => {
+        translated = true;
+    };
     // Translate the outgoing OpenAI Responses request into Gemini deterministically.
     rh.formatConverter.translateOpenAIResponseToGoogle = () => ({
-        googleRequest: { contents: [{ role: "user", parts: [{ text: "hi" }] }] },
         cleanModelName: "gemini-2.5-flash",
+        googleRequest: { contents: [{ parts: [{ text: "hi" }], role: "user" }] },
         modelStreamingMode: null,
     });
 
     const res = {
-        headersSent: false,
-        writableEnded: false,
         __responseApiSeq: null,
+        end: () => {
+            res.writableEnded = true;
+        },
+        headersSent: false,
         status: () => ({ set: () => {} }),
+        writableEnded: false,
         write: () => true,
-        end: () => { res.writableEnded = true; },
     };
     const req = {
-        body: { stream: true, input: "hi", model: "gpt-4o-mini" },
+        body: { input: "hi", model: "gpt-4o-mini", stream: true },
         headers: {},
         method: "POST",
-        url: "/v1/responses",
         protocol: "http",
+        url: "/v1/responses",
     };
 
     // The fake-stream keep-alive timer (12-18s) is left pending after the request finishes and
@@ -250,14 +360,20 @@ test("Response API fake stream: empty upstream body is judged and routed to swit
     assert.strictEqual(switched, true, "empty upstream fake stream must route to account switch + retry");
     assert.strictEqual(errorSent, true, "empty upstream fake stream must send an error to the client");
     assert.strictEqual(dumped, true, "empty upstream fake stream must write a correlation dump");
-    assert.strictEqual(translated, false, "empty upstream fake stream must not translate/send an empty stream to the client");
+    assert.strictEqual(
+        translated,
+        false,
+        "empty upstream fake stream must not translate/send an empty stream to the client"
+    );
 });
 
 // ---- Regression tests for Items 1, 2, 3, 4 ----
 test("Item 1: _dumpUpstreamCorrelation is only called for event_type === 'chunk' with defined data", () => {
     const rh = makeHandler();
     let dumpCalled = false;
-    rh._dumpUpstreamCorrelation = () => { dumpCalled = true; };
+    rh._dumpUpstreamCorrelation = () => {
+        dumpCalled = true;
+    };
 
     // response_headers frame (no data) must NOT call _dumpUpstreamCorrelation
     const headerMsg = { event_type: "response_headers", headers: {} };
@@ -267,7 +383,7 @@ test("Item 1: _dumpUpstreamCorrelation is only called for event_type === 'chunk'
     assert.strictEqual(dumpCalled, false);
 
     // chunk frame with data MUST call _dumpUpstreamCorrelation
-    const chunkMsg = { event_type: "chunk", data: { foo: "bar" } };
+    const chunkMsg = { data: { foo: "bar" }, event_type: "chunk" };
     if (chunkMsg?.event_type === "chunk" && chunkMsg.data !== undefined) {
         rh._dumpUpstreamCorrelation("test", chunkMsg.data, "req-1", "m", 0);
     }
@@ -282,17 +398,21 @@ test("Item 2: _streamOpenAIResponse uses _sendErrorChunkToClient when headers al
     let sseErrorSent = false;
     let jsonErrorSent = false;
 
-    rh._sendErrorChunkToClient = () => { sseErrorSent = true; };
-    rh._sendErrorResponse = () => { jsonErrorSent = true; };
+    rh._sendErrorChunkToClient = () => {
+        sseErrorSent = true;
+    };
+    rh._sendErrorResponse = () => {
+        jsonErrorSent = true;
+    };
 
     const fakeQueue = {
         dequeue: async () => ({ type: "STREAM_END" }),
     };
 
     const res = {
+        end: () => {},
         headersSent: true,
         writableEnded: false,
-        end: () => {},
     };
 
     await rh._streamOpenAIResponse(fakeQueue, res, "gpt-4o", "req-stream-err");
@@ -304,7 +424,12 @@ test("Item 2: _streamOpenAIResponse uses _sendErrorChunkToClient when headers al
 test("Item 3: AuthSwitcher deletes only failing index on non-empty failure, preserving other accounts", async () => {
     const AuthSwitcher = require(path.join(__dirname, "..", "src/auth/AuthSwitcher.js"));
     const mockBrowser = { currentAuthIndex: 0 };
-    const authSwitcher = new AuthSwitcher(stubLogger, { immediateSwitchStatusCodes: [401, 403, 429, 500, 502, 503] }, { getAuthCount: () => 3, getCanonicalIndex: (i) => i }, mockBrowser);
+    const authSwitcher = new AuthSwitcher(
+        stubLogger,
+        { immediateSwitchStatusCodes: [401, 403, 429, 500, 502, 503] },
+        { getAuthCount: () => 3, getCanonicalIndex: i => i },
+        mockBrowser
+    );
     authSwitcher.switchToNextAuth = async () => ({ success: true });
 
     // Simulate empty failure on account 0 and account 1
@@ -327,9 +452,9 @@ test("Item 3: AuthSwitcher deletes only failing index on non-empty failure, pres
 
 test("Item 4: FormatConverter.mergeConsecutiveSameRoleContents merges same roles", () => {
     const googleContents = [
-        { role: "user", parts: [{ text: "a" }] },
-        { role: "user", parts: [{ text: "b" }] },
-        { role: "model", parts: [{ text: "c" }] },
+        { parts: [{ text: "a" }], role: "user" },
+        { parts: [{ text: "b" }], role: "user" },
+        { parts: [{ text: "c" }], role: "model" },
     ];
     const merged = FormatConverter.mergeConsecutiveSameRoleContents(googleContents);
     assert.strictEqual(merged.length, 2);

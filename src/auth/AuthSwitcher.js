@@ -55,7 +55,7 @@ class AuthSwitcher {
     //     return available[nextIndexInArray];
     // }
 
-    async switchToNextAuth() {
+    async switchToNextAuth(failedAuthIndex = this.currentAuthIndex, allowOriginalFallback = true) {
         const available = this.authSource.getRotationIndices();
 
         if (available.length === 0) {
@@ -70,12 +70,8 @@ class AuthSwitcher {
         this.isSystemBusy = true;
 
         try {
-            const failedAuthIndex = this.currentAuthIndex;
-            const getCurrentCanonicalIndex = () => (
-                failedAuthIndex >= 0
-                    ? this.authSource.getCanonicalIndex(failedAuthIndex)
-                    : -1
-            );
+            const getCurrentCanonicalIndex = () =>
+                failedAuthIndex >= 0 ? this.authSource.getCanonicalIndex(failedAuthIndex) : -1;
 
             if (failedAuthIndex >= 0) {
                 const emptyCount = this._emptyJudgmentCounts.get(failedAuthIndex) || 0;
@@ -83,7 +79,9 @@ class AuthSwitcher {
                 // on it. Non-empty failures (429/403/5xx) never dispose — the context stays warm
                 // and the account recovers after cooldown, keeping switching instant.
                 if (emptyCount >= AuthSwitcher.EMPTY_DISPOSE_THRESHOLD) {
-                    this.logger.info(`🗑️ [Auth] Disposing tainted context #${failedAuthIndex} on account switch/retry...`);
+                    this.logger.info(
+                        `🗑️ [Auth] Disposing tainted context #${failedAuthIndex} on account switch/retry...`
+                    );
                     await this.browserManager.closeContext(failedAuthIndex).catch(err => {
                         this.logger.warn(`[Auth] Failed to close context #${failedAuthIndex}: ${err.message}`);
                     });
@@ -130,7 +128,7 @@ class AuthSwitcher {
 
             this.logger.info("==================================================");
             this.logger.info(`🔄 [Auth] Multi-account mode: Starting intelligent account switching`);
-            this.logger.info(`   • Current account: #${this.currentAuthIndex}`);
+            this.logger.info(`   • Failed account: #${failedAuthIndex}`);
             this.logger.info(
                 `   • Available accounts (dedup by email, keeping latest index): [${available.join(", ")}]`
             );
@@ -186,9 +184,8 @@ class AuthSwitcher {
                 }
             }
 
-            // If we had a current account, try it as a final fallback
-            // If we had no current account, we already tried all accounts, so skip fallback
-            if (hasCurrentAccount && originalStartAccount !== null) {
+            // Manual rotation may fall back to the original account; failure recovery must not retry it.
+            if (allowOriginalFallback && hasCurrentAccount && originalStartAccount !== null) {
                 this.logger.warn("==================================================");
                 this.logger.warn(
                     `⚠️ [Auth] All other accounts failed. Making final attempt with original starting account #${originalStartAccount}...`
@@ -293,7 +290,7 @@ class AuthSwitcher {
 
         // Track consecutive empty-upstream judgments per context so we don't dispose/recreate
         // contexts in a hot loop when every account is judged empty. Reset on any non-empty failure.
-        const idx = this.currentAuthIndex;
+        const idx = Number.isInteger(errorDetails.authIndex) ? errorDetails.authIndex : this.currentAuthIndex;
         if (errorDetails.reason === "empty_upstream_response") {
             if (idx >= 0) {
                 this._emptyJudgmentCounts.set(idx, (this._emptyJudgmentCounts.get(idx) || 0) + 1);
@@ -318,7 +315,7 @@ class AuthSwitcher {
             }
 
             try {
-                const result = await this.switchToNextAuth();
+                const result = await this.switchToNextAuth(idx, false);
                 if (!result.success) {
                     this.logger.warn(`⚠️ [Auth] Account switch skipped: ${result.reason}`);
                     if (sendErrorCallback) {

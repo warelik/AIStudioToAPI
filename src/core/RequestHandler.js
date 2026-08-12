@@ -648,14 +648,32 @@ class RequestHandler {
         return { attemptedAuthIndices };
     }
 
+    _withFailureAuthIndex(details, requestId, explicitAuthIndex = null) {
+        if (!details || typeof details !== "object") return details;
+        if (Number.isInteger(details.authIndex)) return details;
+        const requestAuthIndex = Number.isInteger(explicitAuthIndex)
+            ? explicitAuthIndex
+            : this.connectionRegistry?.getAuthIndexForRequest?.(requestId);
+        return Number.isInteger(requestAuthIndex) ? { ...details, authIndex: requestAuthIndex } : details;
+    }
+
+    async _handleAuthFailure(details, requestId, userMessage = null, explicitAuthIndex = null) {
+        return this.authSwitcher?.handleRequestFailureAndSwitch(
+            this._withFailureAuthIndex(details, requestId, explicitAuthIndex),
+            userMessage
+        );
+    }
+
     _getImmediateStatusRetryCloseReason(status) {
         return `immediate_status_retry_${status}`;
     }
 
     async _performImmediateSwitchRetry(errorDetails, requestId, tracker) {
-        await this.authSwitcher.handleRequestFailureAndSwitch(
+        await this._handleAuthFailure(
             { message: errorDetails.message, status: Number(errorDetails.status) },
-            null
+            requestId,
+            null,
+            errorDetails.authIndex
         );
 
         const ready = await this._waitForSystemAndConnectionIfBusy(null, {
@@ -1226,19 +1244,35 @@ class RequestHandler {
                         this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
-                        if (initialMessage && initialMessage.event_type === "chunk" && initialMessage.data !== undefined) {
+                        if (
+                            initialMessage &&
+                            initialMessage.event_type === "chunk" &&
+                            initialMessage.data !== undefined
+                        ) {
                             // Write a correlation dump for EVERY judged upstream response (empty AND
                             // non-empty) so leaks are visible: a non-empty judgment that still yields
                             // completion_tokens=0 shows up here with judged_empty:false.
-                            this._dumpUpstreamCorrelation("processOpenAIRequest:initialMessage", initialMessage.data, requestId, model, currentQueueAuthIndex);
+                            this._dumpUpstreamCorrelation(
+                                "processOpenAIRequest:initialMessage",
+                                initialMessage.data,
+                                requestId,
+                                model,
+                                currentQueueAuthIndex
+                            );
                         }
-                        if (initialMessage && initialMessage.event_type === "chunk" && this._isEmptyUpstreamResponse(initialMessage.data)) {
-                            this.logger.warn(`[Request] Detected empty upstream response on account index ${currentQueueAuthIndex}. Preparing retry...`);
+                        if (
+                            initialMessage &&
+                            initialMessage.event_type === "chunk" &&
+                            this._isEmptyUpstreamResponse(initialMessage.data)
+                        ) {
+                            this.logger.warn(
+                                `[Request] Detected empty upstream response on account index ${currentQueueAuthIndex}. Preparing retry...`
+                            );
                             initialMessage = {
                                 event_type: "error",
-                                status: 502,
                                 message: "Empty upstream completion (zero content, zero tool_calls)",
                                 reason: "empty_upstream_response",
+                                status: 502,
                             };
                         }
 
@@ -1294,7 +1328,7 @@ class RequestHandler {
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this._handleAuthFailure(initialMessage, requestId, null, initialMessage.authIndex);
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1361,7 +1395,7 @@ class RequestHandler {
 
                             // Avoid switching account if the error is just a connection reset
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this._handleAuthFailure(result.error, requestId, null, result.queue?.authIndex);
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1697,7 +1731,7 @@ class RequestHandler {
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this._handleAuthFailure(initialMessage, requestId, null, initialMessage.authIndex);
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1771,7 +1805,7 @@ class RequestHandler {
 
                             // Avoid switching account if the error is just a connection reset
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this._handleAuthFailure(result.error, requestId, null, result.queue?.authIndex);
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -1876,11 +1910,14 @@ class RequestHandler {
                                         res,
                                         requestId
                                     );
-                                    this.authSwitcher?.handleRequestFailureAndSwitch({
-                                        status: 502,
-                                        reason: "empty_upstream_response",
-                                        message: "Empty upstream response (Response API fake stream)",
-                                    }, null);
+                                    this._handleAuthFailure(
+                                        {
+                                            message: "Empty upstream response (Response API fake stream)",
+                                            reason: "empty_upstream_response",
+                                            status: 502,
+                                        },
+                                        requestId
+                                    );
                                     return;
                                 }
 
@@ -2095,7 +2132,7 @@ class RequestHandler {
                         });
                         this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message, "api_error");
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
+                            await this._handleAuthFailure(initialMessage, requestId, null, initialMessage.authIndex);
                         } else if (skipFinalFailureSwitch) {
                             this.logger.info(
                                 "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2157,7 +2194,7 @@ class RequestHandler {
                                 );
                             }
                             if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                                await this._handleAuthFailure(result.error, requestId, null, result.queue?.authIndex);
                             } else if (result.error.skipAccountSwitch) {
                                 this.logger.info(
                                     "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2370,7 +2407,7 @@ class RequestHandler {
                     );
                     this._sendErrorResponse(res, response.status || 500, response.message, "api_error");
                     if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                        await this._handleAuthFailure(response, requestId, null, response.authIndex);
                     }
                     return;
                 }
@@ -2514,7 +2551,7 @@ class RequestHandler {
 
                     // Avoid switching account if the error is just a connection reset
                     if (!this._isConnectionResetError(response)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(response, null);
+                        await this._handleAuthFailure(response, requestId, null, response.authIndex);
                     } else {
                         this.logger.info(
                             "[Request] Failure due to connection reset (input_tokens), skipping account switch."
@@ -2600,11 +2637,16 @@ class RequestHandler {
                         this.logger.warn(
                             `⚠️ [Request] Upstream stream judged empty at STREAM_END (request ${requestId}); switching account and returning 502.`
                         );
-                        this.authSwitcher?.handleRequestFailureAndSwitch({
-                            status: 502,
-                            reason: "empty_upstream_response",
-                            message: "Empty upstream response (stream)",
-                        }, null);
+                        this._handleAuthFailure(
+                            {
+                                message: "Empty upstream response (stream)",
+                                reason: "empty_upstream_response",
+                                status: 502,
+                            },
+                            requestId,
+                            null,
+                            message.authIndex
+                        );
                         this._sendErrorResponse(res, 502, "Empty upstream response");
                         break;
                     }
@@ -2788,7 +2830,12 @@ class RequestHandler {
 
                     // Avoid switching account if the error is just a connection reset
                     if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                        await this._handleAuthFailure(
+                            result.error,
+                            proxyRequest.request_id,
+                            null,
+                            result.queue?.authIndex
+                        );
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
                             "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -2888,11 +2935,14 @@ class RequestHandler {
                         res,
                         proxyRequest.request_id
                     );
-                    this.authSwitcher?.handleRequestFailureAndSwitch({
-                        status: 502,
-                        reason: "empty_upstream_response",
-                        message: "Empty upstream response (pseudo-stream)",
-                    }, null);
+                    this._handleAuthFailure(
+                        {
+                            message: "Empty upstream response (pseudo-stream)",
+                            reason: "empty_upstream_response",
+                            status: 502,
+                        },
+                        proxyRequest.request_id
+                    );
                     return;
                 }
 
@@ -3084,9 +3134,9 @@ class RequestHandler {
                 );
                 headerMessage = {
                     event_type: "error",
-                    status: 502,
                     message: "Empty upstream completion (zero content, zero function calls)",
                     reason: "empty_upstream_response",
+                    status: 502,
                 };
             }
 
@@ -3143,7 +3193,7 @@ class RequestHandler {
                 });
                 // Avoid switching account if the error is just a connection reset
                 if (!skipFinalFailureSwitch && !this._isConnectionResetError(headerMessage)) {
-                    await this.authSwitcher.handleRequestFailureAndSwitch(headerMessage, null);
+                    await this._handleAuthFailure(headerMessage, proxyRequest.request_id, null, currentQueueAuthIndex);
                 } else if (skipFinalFailureSwitch) {
                     this.logger.info(
                         "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3250,7 +3300,12 @@ class RequestHandler {
                     this._logFinalRequestFailure(result.error, "Gemini non-stream", proxyRequest.request_id);
                     // Avoid switching account if the error is just a connection reset
                     if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                        await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
+                        await this._handleAuthFailure(
+                            result.error,
+                            proxyRequest.request_id,
+                            null,
+                            result.queue?.authIndex
+                        );
                     } else if (result.error.skipAccountSwitch) {
                         this.logger.info(
                             "[Request] Immediate-switch retries exhausted, skipping additional account switch."
@@ -3383,14 +3438,21 @@ class RequestHandler {
         return fullBody;
     }
 
-    
     _isEmptyUpstreamResponse(data) {
         if (!data) return true;
         let obj = typeof data === "object" ? data : null;
         if (typeof data === "string") {
-            try { obj = JSON.parse(data); } catch (e) {
+            try {
+                obj = JSON.parse(data);
+            } catch (e) {
                 const match = data.match(/data:\s*(\{.*\})/);
-                if (match) { try { obj = JSON.parse(match[1]); } catch (e2) {} }
+                if (match) {
+                    try {
+                        obj = JSON.parse(match[1]);
+                    } catch (e2) {
+                        /* empty */
+                    }
+                }
             }
             // The raw chunk may be a fragmented SSE stream: multiple `data:` events in one chunk,
             // or a partial event split across browser network chunks. If we can't cleanly parse it
@@ -3406,7 +3468,11 @@ class RequestHandler {
                     const payload = line.slice(dIdx > 0 ? dIdx + 5 : 5).trim();
                     if (!payload || payload === "[DONE]") continue;
                     let evtObj = null;
-                    try { evtObj = JSON.parse(payload); } catch (e3) { continue; }
+                    try {
+                        evtObj = JSON.parse(payload);
+                    } catch (e3) {
+                        continue;
+                    }
                     // If ANY event carries content or is non-terminal, the stream is not empty.
                     if (!this._isEmptyUpstreamResponse(evtObj)) return false;
                 }
@@ -3417,6 +3483,22 @@ class RequestHandler {
         }
         if (!obj) return true;
 
+        if (Array.isArray(obj.content)) {
+            const hasAnthropicContent = obj.content.some(block => {
+                if (!block || typeof block !== "object") return false;
+                if (block.type === "text" || block.type === "thinking" || block.type === "redacted_thinking") {
+                    return typeof block.text === "string" && block.text.trim().length > 0;
+                }
+                if (block.type === "tool_use") {
+                    return typeof block.name === "string" && block.name.trim().length > 0;
+                }
+                return typeof block.type === "string" && block.type.length > 0;
+            });
+            if (hasAnthropicContent) return false;
+            if (!obj.stop_reason) return false;
+            return (obj.usage?.output_tokens ?? 0) === 0;
+        }
+
         if (obj.candidates && Array.isArray(obj.candidates)) {
             if (obj.promptFeedback && obj.promptFeedback.blockReason) return false;
             const cand = obj.candidates[0];
@@ -3424,7 +3506,8 @@ class RequestHandler {
             const parts = cand.content?.parts || [];
             const hasToolCalls = parts.some(p => p.functionCall && p.functionCall.name);
             const hasNonWhitespaceText = parts.some(p => typeof p.text === "string" && p.text.trim().length > 0);
-            const completionTokens = (obj.usageMetadata?.candidatesTokenCount ?? 0) + (obj.usageMetadata?.thoughtsTokenCount ?? 0);
+            const completionTokens =
+                (obj.usageMetadata?.candidatesTokenCount ?? 0) + (obj.usageMetadata?.thoughtsTokenCount ?? 0);
             const isTerminal = !!cand.finishReason;
 
             // Real content (tool call or non-whitespace text) → not empty.
@@ -3463,18 +3546,23 @@ class RequestHandler {
         try {
             if (!this._isEmptyUpstreamResponse(rawData)) return; // diagnostic is for judged-empty only
             const rawText = typeof rawData === "string" ? rawData : JSON.stringify(rawData);
-            require("fs").appendFileSync(dumpPath, JSON.stringify({
-                timestamp: new Date().toISOString(),
-                site: siteTag,
-                request_id: requestId,
-                model,
-                account_index: authIndex,
-                judged_empty: true,
-                raw_response_length: rawText.length,
-                raw_response: rawText.slice(0, 200000),
-            }) + "\n");
+            require("fs").appendFileSync(
+                dumpPath,
+                JSON.stringify({
+                    account_index: authIndex,
+                    judged_empty: true,
+                    model,
+                    raw_response: rawText.slice(0, 200000),
+                    raw_response_length: rawText.length,
+                    request_id: requestId,
+                    site: siteTag,
+                    timestamp: new Date().toISOString(),
+                }) + "\n"
+            );
         } catch (e) {
-            this.logger.error(`❌ [Dump] Failed to write DUMP_EMPTY_UPSTREAM record to "${dumpPath}": ${e?.message || e}. Check the path is writable and exists.`);
+            this.logger.error(
+                `❌ [Dump] Failed to write DUMP_EMPTY_UPSTREAM record to "${dumpPath}": ${e?.message || e}. Check the path is writable and exists.`
+            );
         }
     }
 
@@ -3747,11 +3835,16 @@ class RequestHandler {
                         this.logger.warn(
                             `⚠️ [Request] Upstream stream judged empty at STREAM_END (request ${requestId}); switching account and returning 502.`
                         );
-                        this.authSwitcher?.handleRequestFailureAndSwitch({
-                            status: 502,
-                            reason: "empty_upstream_response",
-                            message: "Empty upstream response (stream)",
-                        }, null);
+                        this._handleAuthFailure(
+                            {
+                                message: "Empty upstream response (stream)",
+                                reason: "empty_upstream_response",
+                                status: 502,
+                            },
+                            requestId,
+                            null,
+                            message.authIndex
+                        );
                         this._sendErrorResponse(res, 502, "Empty upstream response");
                         break;
                     }
@@ -3877,11 +3970,16 @@ class RequestHandler {
                         this.logger.warn(
                             `⚠️ [Request] Upstream stream judged empty at STREAM_END (request ${requestId}); switching account and returning 502.`
                         );
-                        this.authSwitcher?.handleRequestFailureAndSwitch({
-                            status: 502,
-                            reason: "empty_upstream_response",
-                            message: "Empty upstream response (stream)",
-                        }, null);
+                        this._handleAuthFailure(
+                            {
+                                message: "Empty upstream response (stream)",
+                                reason: "empty_upstream_response",
+                                status: 502,
+                            },
+                            requestId,
+                            null,
+                            message.authIndex
+                        );
                         if (res.headersSent) {
                             this._sendErrorChunkToClient(res, "Empty upstream response", 502);
                         } else {
@@ -3998,8 +4096,8 @@ class RequestHandler {
         // Extract the `data:` payload lines (SSE events may include `event:`/`id:`/`retry:` lines).
         const dataLines = trimmed
             .split("\n")
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice(5).trim());
+            .filter(line => line.startsWith("data:"))
+            .map(line => line.slice(5).trim());
         if (dataLines.length === 0) return null;
         // A single event may carry multiple `data:` lines (SSE spec: concatenated with \n).
         const payload = dataLines.join("\n");
@@ -4106,11 +4204,14 @@ class RequestHandler {
         this.logger.warn(
             `⚠️ [Request] Upstream non-stream response judged empty (request ${requestId}); switching account and returning 502.`
         );
-        this.authSwitcher?.handleRequestFailureAndSwitch({
-            status: 502,
-            reason: "empty_upstream_response",
-            message: "Empty upstream response (non-stream)",
-        }, null);
+        this._handleAuthFailure(
+            {
+                message: "Empty upstream response (non-stream)",
+                reason: "empty_upstream_response",
+                status: 502,
+            },
+            requestId
+        );
         this._sendErrorResponse(res, 502, "Empty upstream response");
     }
 
