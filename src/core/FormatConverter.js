@@ -1970,36 +1970,36 @@ class FormatConverter {
         let reasoningContent = "";
         if (candidate.content && Array.isArray(candidate.content.parts)) {
             for (const part of candidate.content.parts) {
-                    // Check functionCall FIRST so a part annotated with `thought: true` alongside a
-                    // tool call is not dropped by the reasoning branch below.
-                    if (part?.functionCall) {
-                        // Function call
-                        const funcCall = part.functionCall;
-                        const callId = `call_${this._generateRequestId()}`;
-                        output.push({
-                            arguments: JSON.stringify(funcCall.args || {}),
-                            call_id: callId,
-                            id: `fc-${this._generateRequestId()}`,
-                            name: funcCall.name,
-                            status: "completed",
-                            type: "function_call",
-                        });
-                        this.logger.info(
-                            `[Adapter] Converted Gemini functionCall to Response API function_call: ${funcCall.name}`
-                        );
-                    } else if (part?.thought === true) {
-                        if (part?.text) reasoningContent += part.text;
-                    } else if (part.text) {
-                        // Regular text content
-                        messageContent += part.text;
-                    } else if (part.inlineData) {
-                        // Responses API image outputs are intentionally suppressed by this proxy; preserve a text note.
-                        if (!messageContent) {
-                            messageContent =
-                                "[Image output omitted: Responses API image outputs are disabled by this proxy.]";
-                        }
+                // Check functionCall FIRST so a part annotated with `thought: true` alongside a
+                // tool call is not dropped by the reasoning branch below.
+                if (part?.functionCall) {
+                    // Function call
+                    const funcCall = part.functionCall;
+                    const callId = `call_${this._generateRequestId()}`;
+                    output.push({
+                        arguments: JSON.stringify(funcCall.args || {}),
+                        call_id: callId,
+                        id: `fc-${this._generateRequestId()}`,
+                        name: funcCall.name,
+                        status: "completed",
+                        type: "function_call",
+                    });
+                    this.logger.info(
+                        `[Adapter] Converted Gemini functionCall to Response API function_call: ${funcCall.name}`
+                    );
+                } else if (part?.thought === true) {
+                    if (part?.text) reasoningContent += part.text;
+                } else if (part.text) {
+                    // Regular text content
+                    messageContent += part.text;
+                } else if (part.inlineData) {
+                    // Responses API image outputs are intentionally suppressed by this proxy; preserve a text note.
+                    if (!messageContent) {
+                        messageContent =
+                            "[Image output omitted: Responses API image outputs are disabled by this proxy.]";
                     }
                 }
+            }
         }
 
         if (reasoningContent) {
