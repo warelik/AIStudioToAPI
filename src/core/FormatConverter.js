@@ -832,7 +832,6 @@ class FormatConverter {
         flushToolParts();
 
         // Merge consecutive contents with the same role (Gemini API requires strict role alternation)
-        // Merge consecutive contents with the same role (Gemini API requires strict role alternation).
         const mergedContents = FormatConverter.mergeConsecutiveSameRoleContents(googleContents);
 
         // Build Google request
