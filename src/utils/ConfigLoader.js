@@ -40,7 +40,7 @@ class ConfigLoader {
             retryDelay: 2000,
             safetySettingsThreshold: "OFF",
             streamingMode: "real",
-            streamTimeoutMs: 60000,
+            streamTimeoutMs: 0,
             switchOnUses: 40,
             wsPort: 9998,
         };
@@ -68,11 +68,9 @@ class ConfigLoader {
             const parsed = parseInt(process.env.RETRY_DELAY, 10);
             config.retryDelay = Number.isFinite(parsed) ? Math.max(50, parsed) : config.retryDelay;
         }
-        if (process.env.STREAM_TIMEOUT_MS) {
+        if (process.env.STREAM_TIMEOUT_MS !== undefined) {
             const parsed = parseInt(process.env.STREAM_TIMEOUT_MS, 10);
-            config.streamTimeoutMs = Number.isFinite(parsed)
-                ? Math.min(300000, Math.max(1, parsed))
-                : config.streamTimeoutMs;
+            config.streamTimeoutMs = Number.isFinite(parsed) ? Math.min(300000, Math.max(0, parsed)) : 0;
         }
         if (process.env.FAKE_STREAM_TIMEOUT_MS) {
             const parsed = parseInt(process.env.FAKE_STREAM_TIMEOUT_MS, 10);

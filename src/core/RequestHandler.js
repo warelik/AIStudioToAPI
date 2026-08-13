@@ -20,7 +20,7 @@ const WS_CONNECTION_READY_TIMEOUT_MS = 10000;
 // Default timeout constants (in milliseconds)
 const DEFAULT_TIMEOUTS = {
     FAKE_STREAM: 300000, // 300 seconds (5 minutes) - timeout for fake streaming (buffered response)
-    STREAM_CHUNK: 60000, // 60 seconds - timeout between stream chunks
+    STREAM_CHUNK: 0, // 0 = disabled - timeout between stream chunks
 };
 
 class RequestHandler {
