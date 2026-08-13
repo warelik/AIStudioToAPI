@@ -35,7 +35,7 @@ class QueueTimeoutError extends Error {
  * Responsible for managing asynchronous message enqueue and dequeue
  */
 class MessageQueue extends EventEmitter {
-    constructor(timeoutMs = 0) {
+    constructor(timeoutMs = 300000) {
         super();
         this.messages = [];
         this.waitingResolvers = [];

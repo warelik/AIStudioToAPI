@@ -367,6 +367,220 @@ test("Response API fake stream: empty upstream body is judged and routed to swit
     );
 });
 
+// ---- OpenAI chat fake stream: terminal empty upstream routes to switch+retry ----
+test("OpenAI chat fake stream: empty upstream body is judged and routed to switch+retry, not leaked", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    rh.config = { forceThinking: false, streamingMode: "fake", switchOnUses: 0, thinkingLevel: null };
+    rh.needsSwitchingAfterRequest = false;
+    rh.timeouts = { FAKE_STREAM: 100 };
+
+    let switched = false;
+    let switchCount = 0;
+    let errorSent = false;
+    let dumped = false;
+    let translated = false;
+
+    rh.authSwitcher = {
+        handleRequestFailureAndSwitch: async () => {
+            switchCount++;
+            switched = true;
+        },
+        incrementUsageCount: () => 0,
+    };
+
+    // Empty upstream: whitespace-only STOP body with zero completion tokens accumulated in fullBody.
+    const emptyBody = JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "   " }] }, finishReason: "STOP" }],
+        usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+    });
+    let dequeues = 0;
+    const fakeQueue = {
+        dequeue: async () => {
+            dequeues++;
+            if (dequeues === 1) {
+                return { data: emptyBody, event_type: "chunk" };
+            }
+            return { type: "STREAM_END" };
+        },
+    };
+
+    rh.connectionRegistry = {
+        createMessageQueue: () => fakeQueue,
+        removeMessageQueue: () => {},
+    };
+    rh._generateRequestId = () => "test-openai-chat-fake-empty";
+    rh._startTrackedRequest = () => {};
+    rh._setResponseApiFormat = (res, fmt) => {
+        res.__responseApiFormat = fmt;
+    };
+    rh._ensureBrowserBackedRequestReady = async () => true;
+    rh._setupClientDisconnectHandler = () => {};
+    rh._initializeProxyRequestAttempt = () => {};
+    rh._updateTrackedRequest = () => {};
+    rh._getUsageStatsService = () => null;
+    rh._executeRequestWithRetries = async () => ({ queue: fakeQueue, success: true });
+    rh._forwardRequest = async () => {};
+    rh._dumpUpstreamCorrelation = () => {
+        dumped = true;
+    };
+    // _handleRequestError may be the SSE-error path; deflect it to prevent actual writes.
+    rh._handleRequestError = () => {
+        errorSent = true;
+    };
+    rh._finalizeTrackedRequest = () => {};
+    rh._isResponseWritable = () => true;
+    rh._handleQueueTimeout = () => {};
+
+    // Must NOT be reached: an empty upstream must not translate into a client stream.
+    rh.formatConverter.translateGoogleToOpenAIStream = () => {
+        translated = true;
+    };
+    // Translate the outgoing OpenAI chat request into Gemini deterministically.
+    rh.formatConverter.translateOpenAIToGoogle = () => ({
+        cleanModelName: "gemini-2.5-flash",
+        googleRequest: { contents: [{ parts: [{ text: "hi" }], role: "user" }] },
+        modelStreamingMode: null,
+    });
+
+    const res = {
+        end: () => {
+            res.writableEnded = true;
+        },
+        headersSent: false,
+        status: () => ({ set: () => {} }),
+        writableEnded: false,
+        write: () => true,
+    };
+    const req = {
+        body: { messages: [{ content: "hi", role: "user" }], model: "gpt-4o-mini", stream: true },
+        headers: {},
+        method: "POST",
+        protocol: "http",
+        url: "/v1/chat/completions",
+    };
+
+    // The fake-stream keep-alive timer is left pending after the request finishes and would hold
+    // the test runner's event loop open. Replace long timers with an immediate no-op.
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) =>
+        ms >= 1000 ? realSetTimeout(() => {}, 0, ...args) : realSetTimeout(fn, ms, ...args);
+    try {
+        await rh.processOpenAIRequest(req, res);
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+
+    assert.strictEqual(switched, true, "empty upstream fake stream must route to account switch + retry");
+    assert.strictEqual(switchCount, 1, "empty upstream fake stream must trigger exactly one auth switch");
+    assert.strictEqual(errorSent, true, "empty upstream fake stream must send an error to the client");
+    assert.strictEqual(dumped, true, "empty upstream fake stream must write a correlation dump");
+    assert.strictEqual(
+        translated,
+        false,
+        "empty upstream fake stream must not translate/send an empty completion to the client"
+    );
+});
+
+// ---- OpenAI chat fake stream: non-empty upstream still translates (no behavior change) ----
+test("OpenAI chat fake stream: non-empty upstream still translates to the client", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    rh.config = { forceThinking: false, streamingMode: "fake", switchOnUses: 0, thinkingLevel: null };
+    rh.needsSwitchingAfterRequest = false;
+    rh.timeouts = { FAKE_STREAM: 100 };
+
+    let switchCount = 0;
+    const written = [];
+    let translatedChunk = "data: {}\n\n";
+
+    rh.authSwitcher = {
+        handleRequestFailureAndSwitch: async () => {
+            switchCount++;
+        },
+        incrementUsageCount: () => 0,
+    };
+
+    const nonEmptyBody = JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "hello" }] }, finishReason: "STOP" }],
+        usageMetadata: { candidatesTokenCount: 5, thoughtsTokenCount: 0 },
+    });
+    const fakeQueue = {
+        dequeue: async () => {
+            if (!fakeQueue._sent) {
+                fakeQueue._sent = true;
+                return { data: nonEmptyBody, event_type: "chunk" };
+            }
+            return { type: "STREAM_END" };
+        },
+    };
+
+    rh.connectionRegistry = {
+        createMessageQueue: () => fakeQueue,
+        removeMessageQueue: () => {},
+    };
+    rh._generateRequestId = () => "test-openai-chat-fake-nonempty";
+    rh._startTrackedRequest = () => {};
+    rh._setResponseApiFormat = () => {};
+    rh._ensureBrowserBackedRequestReady = async () => true;
+    rh._setupClientDisconnectHandler = () => {};
+    rh._initializeProxyRequestAttempt = () => {};
+    rh._updateTrackedRequest = () => {};
+    rh._getUsageStatsService = () => null;
+    rh._executeRequestWithRetries = async () => ({ queue: fakeQueue, success: true });
+    rh._forwardRequest = async () => {};
+    rh._dumpUpstreamCorrelation = () => {};
+    rh._handleRequestError = () => {};
+    rh._finalizeTrackedRequest = () => {};
+    rh._isResponseWritable = () => true;
+    rh._handleQueueTimeout = () => {};
+
+    rh.formatConverter.translateGoogleToOpenAIStream = fullBody => {
+        translatedChunk = `data: ${JSON.stringify({ content: fullBody })}\n\n`;
+        return translatedChunk;
+    };
+    rh.formatConverter.translateOpenAIToGoogle = () => ({
+        cleanModelName: "gemini-2.5-flash",
+        googleRequest: { contents: [{ parts: [{ text: "hi" }], role: "user" }] },
+        modelStreamingMode: null,
+    });
+
+    const res = {
+        end: () => {
+            res.writableEnded = true;
+        },
+        headersSent: false,
+        status: () => ({ set: () => {} }),
+        writableEnded: false,
+        write: chunk => {
+            written.push(chunk);
+            return true;
+        },
+    };
+    const req = {
+        body: { messages: [{ content: "hi", role: "user" }], model: "gpt-4o-mini", stream: true },
+        headers: {},
+        method: "POST",
+        protocol: "http",
+        url: "/v1/chat/completions",
+    };
+
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) =>
+        ms >= 1000 ? realSetTimeout(() => {}, 0, ...args) : realSetTimeout(fn, ms, ...args);
+    try {
+        await rh.processOpenAIRequest(req, res);
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+
+    assert.strictEqual(switchCount, 0, "non-empty upstream must not switch accounts");
+    assert.ok(
+        written.some(chunk => chunk.includes("data: ")),
+        "translated stream must be written to the client"
+    );
+});
+
 // ---- Regression tests for Items 1, 2, 3, 4 ----
 test("Item 1: _dumpUpstreamCorrelation is only called for event_type === 'chunk' with defined data", () => {
     const rh = makeHandler();

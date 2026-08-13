@@ -3,6 +3,34 @@ const assert = require("node:assert");
 const MessageQueue = require("../src/utils/MessageQueue");
 const { QueueTimeoutError, QueueClosedError } = require("../src/utils/MessageQueue");
 
+test("MessageQueue no-arg constructor retains a finite default timeout (300000ms)", async () => {
+    const queue = new MessageQueue();
+    assert.strictEqual(queue.defaultTimeout, 300000, "no-arg must keep the finite 300000ms default");
+
+    // A no-arg dequeue applies the constructor default: with a small default it times out.
+    const smallQueue = new MessageQueue(10);
+    assert.strictEqual(smallQueue.defaultTimeout, 10);
+    await assert.rejects(async () => {
+        await smallQueue.dequeue();
+    }, QueueTimeoutError);
+});
+
+test("MessageQueue explicit 0 remains unlimited (no-arg dequeue on a 0-constructed queue)", async () => {
+    const queue = new MessageQueue(0);
+    assert.strictEqual(queue.defaultTimeout, 0, "explicit 0 must stay unlimited");
+
+    let resolved = false;
+    const promise = queue.dequeue().then(msg => {
+        resolved = true;
+        return msg;
+    });
+    await new Promise(r => setTimeout(r, 50));
+    assert.strictEqual(resolved, false, "no-arg dequeue on explicit-0 queue must remain pending");
+
+    queue.enqueue("hello");
+    assert.strictEqual(await promise, "hello");
+});
+
 test("MessageQueue dequeue(0) remains pending until chunk is enqueued", async () => {
     const queue = new MessageQueue();
     let resolved = false;

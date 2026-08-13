@@ -1476,6 +1476,41 @@ class RequestHandler {
                                     // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
                                     return;
                                 }
+
+                                // Terminal emptiness judgment for the OpenAI chat fake-stream path, mirroring
+                                // the Response API/Claude fake-stream paths: an empty aggregate body must
+                                // enter the existing single auth-failure + SSE error flow, with no duplicate
+                                // switch and no leaked empty completion.
+                                if (this._isEmptyUpstreamResponse(fullBody)) {
+                                    this._dumpUpstreamCorrelation(
+                                        "openai-chat-fake-stream",
+                                        fullBody,
+                                        requestId,
+                                        model,
+                                        this.currentAuthIndex
+                                    );
+                                    this.logger.warn(
+                                        `⚠️ [Request] Upstream fake-stream response judged empty (request ${requestId}); switching account and ending stream.`
+                                    );
+                                    this._handleRequestError(
+                                        {
+                                            message: "Empty upstream response (OpenAI chat fake stream)",
+                                            reason: "empty_upstream_response",
+                                        },
+                                        res,
+                                        requestId
+                                    );
+                                    this._handleAuthFailure(
+                                        {
+                                            message: "Empty upstream response (OpenAI chat fake stream)",
+                                            reason: "empty_upstream_response",
+                                            status: 502,
+                                        },
+                                        requestId
+                                    );
+                                    return;
+                                }
+
                                 const streamState = {};
                                 const translatedChunk = this.formatConverter.translateGoogleToOpenAIStream(
                                     fullBody,
