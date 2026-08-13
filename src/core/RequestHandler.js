@@ -2861,9 +2861,8 @@ class RequestHandler {
 
         try {
             const googleResponse = JSON.parse(fullBody);
-            // Write a correlation dump for EVERY judged upstream response (empty AND non-empty) so
-            // leaks are visible: a non-empty judgment that still yields an empty Claude output shows up
-            // here with judged_empty:false.
+            // Write a judged-empty-only correlation dump (the helper early-returns on non-empty),
+            // gated by DUMP_EMPTY_UPSTREAM. Non-empty upstream responses are not recorded here.
             this._dumpUpstreamCorrelation("non-stream", fullBody, requestId, model, this.currentAuthIndex);
             // Terminal emptiness judgment for the Claude non-stream path.
             if (this._isEmptyUpstreamResponse(googleResponse)) {
@@ -4252,9 +4251,8 @@ class RequestHandler {
         // Parse and convert to OpenAI Response API format
         try {
             const googleResponse = JSON.parse(fullBody);
-            // Write a correlation dump for EVERY judged upstream response (empty AND non-empty) so
-            // leaks are visible: a non-empty judgment that still yields an empty Response API output
-            // shows up here with judged_empty:false.
+            // Write a judged-empty-only correlation dump (the helper early-returns on non-empty),
+            // gated by DUMP_EMPTY_UPSTREAM. Non-empty upstream responses are not recorded here.
             this._dumpUpstreamCorrelation("non-stream", fullBody, requestId, model, this.currentAuthIndex);
             // Terminal emptiness judgment for the OpenAI Response API non-stream path.
             if (this._isEmptyUpstreamResponse(googleResponse)) {
@@ -4301,9 +4299,8 @@ class RequestHandler {
         // Parse and convert to OpenAI format
         try {
             const googleResponse = JSON.parse(fullBody);
-            // Write a correlation dump for EVERY judged upstream response (empty AND non-empty) so
-            // leaks are visible: a non-empty judgment that still yields completion_tokens=0 shows up
-            // here with judged_empty:false.
+            // Write a judged-empty-only correlation dump (the helper early-returns on non-empty),
+            // gated by DUMP_EMPTY_UPSTREAM. Non-empty upstream responses are not recorded here.
             this._dumpUpstreamCorrelation("non-stream", fullBody, requestId, model, this.currentAuthIndex);
             // Terminal emptiness judgment for the non-stream path. The full upstream body is a single
             // completed response — judge it now (whitespace-only/empty text with stop and ct=0 is
