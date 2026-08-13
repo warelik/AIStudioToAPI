@@ -3373,8 +3373,39 @@ class FormatConverter {
 
         if (reasoning) {
             thinkingConfig = { includeThoughts: true };
+            // Map Responses reasoning.effort (and the compatible top-level reasoning_effort alias)
+            // through THINKING_LEVEL_MAP, exactly like the chat path maps reasoning_effort.
+            const effort = reasoning.effort ?? reasoning.reasoning_effort;
+            if (effort != null) {
+                const normalizedEffort = String(effort).trim().toLowerCase();
+                const mappedLevel = FormatConverter.THINKING_LEVEL_MAP[normalizedEffort];
+                if (mappedLevel) {
+                    thinkingConfig.thinkingLevel = mappedLevel;
+                    this.logger.debug(
+                        `[Adapter] Detected OpenAI Response reasoning.effort (${normalizedEffort}), mapped thinkingLevel to ${mappedLevel}.`
+                    );
+                } else {
+                    this.logger.debug(
+                        "[Adapter] Detected OpenAI Response reasoning parameter (reasoning.effort), auto-converting to Google format."
+                    );
+                }
+            }
+        } else if (responseBody.reasoning_effort != null) {
+            // Compatible top-level alias (chat-style reasoning_effort) without a reasoning object.
+            const normalizedEffort = String(responseBody.reasoning_effort).trim().toLowerCase();
+            const mappedLevel = FormatConverter.THINKING_LEVEL_MAP[normalizedEffort];
+            thinkingConfig = { includeThoughts: true };
+            if (mappedLevel) {
+                thinkingConfig.thinkingLevel = mappedLevel;
+                this.logger.debug(
+                    `[Adapter] Detected OpenAI Response reasoning_effort (${normalizedEffort}), mapped thinkingLevel to ${mappedLevel}.`
+                );
+            } else {
+                this.logger.debug(
+                    "[Adapter] Detected OpenAI Response reasoning_effort, auto-converting to Google format."
+                );
+            }
         }
-
         // Force thinking mode (only set includeThoughts=true when missing)
         if (
             this.serverSystem.config.forceThinking &&

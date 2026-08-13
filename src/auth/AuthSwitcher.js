@@ -33,6 +33,17 @@ class AuthSwitcher {
     set currentAuthIndex(value) {
         this.browserManager.currentAuthIndex = value;
     }
+    /**
+     * Reset the consecutive empty-upstream judgment counter for a successful auth index.
+     * A success on an account means its next empty judgment starts counting from 1 again;
+     * only consecutive empties without an intervening success may reach the dispose threshold.
+     * @param {number|null} authIndex - The account index that served a successful request.
+     */
+    resetEmptyJudgmentCountForAuth(authIndex) {
+        if (Number.isInteger(authIndex) && authIndex >= 0) {
+            this._emptyJudgmentCounts.delete(authIndex);
+        }
+    }
 
     // getNextAuthIndex() {
     //     const available = this.authSource.getRotationIndices();

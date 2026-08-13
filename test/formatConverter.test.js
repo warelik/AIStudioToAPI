@@ -547,11 +547,77 @@ test("usage outputs do not include invented Claude or prompt-cache resource fiel
         "cache_key",
         "cache_creation_tokens",
     ];
-
     for (const field of forbiddenFields) {
         assert.strictEqual(chatRes.usage[field], undefined);
         assert.strictEqual(chatRes.usage.prompt_tokens_details[field], undefined);
         assert.strictEqual(respRes.usage[field], undefined);
         assert.strictEqual(respRes.usage.input_tokens_details[field], undefined);
     }
+});
+
+// ---- Studio PR #228: Responses reasoning.effort mapping through THINKING_LEVEL_MAP ----
+test("translateOpenAIResponseToGoogle maps reasoning.effort to thinkingLevel via THINKING_LEVEL_MAP", async () => {
+    const fc = makeConverter();
+    const cases = [
+        { effort: "minimal", expected: "MINIMAL" },
+        { effort: "low", expected: "LOW" },
+        { effort: "medium", expected: "MEDIUM" },
+        { effort: "high", expected: "HIGH" },
+        { effort: "  HIGH  ", expected: "HIGH" },
+    ];
+
+    for (const { effort, expected } of cases) {
+        const body = {
+            input: "hi",
+            model: "gemini-2.5-flash",
+            reasoning: { effort },
+        };
+        const { googleRequest } = await fc.translateOpenAIResponseToGoogle(body);
+        assert.deepStrictEqual(
+            googleRequest.generationConfig.thinkingConfig,
+            { includeThoughts: true, thinkingLevel: expected },
+            `reasoning.effort=${effort}`
+        );
+    }
+});
+
+test("translateOpenAIResponseToGoogle supports top-level reasoning_effort alias", async () => {
+    const fc = makeConverter();
+    const body = {
+        input: "hi",
+        model: "gemini-2.5-flash",
+        reasoning_effort: "low",
+    };
+    const { googleRequest } = await fc.translateOpenAIResponseToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingLevel: "LOW",
+    });
+});
+
+test("translateOpenAIResponseToGoogle preserves model suffix precedence over reasoning.effort", async () => {
+    const fc = makeConverter();
+    const body = {
+        input: "hi",
+        model: "gemini-2.5-pro:thinking-high",
+        reasoning: { effort: "low" },
+    };
+    const { googleRequest } = await fc.translateOpenAIResponseToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingLevel: "HIGH",
+    });
+});
+
+test("translateOpenAIResponseToGoogle fallback for unknown reasoning.effort keeps includeThoughts only", async () => {
+    const fc = makeConverter();
+    const body = {
+        input: "hi",
+        model: "gemini-2.5-flash",
+        reasoning: { effort: "custom_unknown" },
+    };
+    const { googleRequest } = await fc.translateOpenAIResponseToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+    });
 });

@@ -462,3 +462,490 @@ test("Item 4: FormatConverter.mergeConsecutiveSameRoleContents merges same roles
     assert.deepStrictEqual(merged[0].parts, [{ text: "a" }, { text: "b" }]);
     assert.strictEqual(merged[1].role, "model");
 });
+
+// ---- Studio PR #228 adjudication regressions ----
+
+// Fix 2: control finish reasons are valid non-empty results even with zero completion tokens.
+test("_isEmptyUpstreamResponse: Gemini control finish reasons are NOT empty with zero tokens", () => {
+    const rh = makeHandler();
+    for (const reason of ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"]) {
+        const resp = {
+            candidates: [{ content: { parts: [] }, finishReason: reason }],
+            usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+        };
+        assert.strictEqual(
+            rh._isEmptyUpstreamResponse(resp),
+            false,
+            `finishReason ${reason} must be a valid non-empty control result`
+        );
+    }
+    // STOP with whitespace + zero tokens stays empty.
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({
+            candidates: [{ content: { parts: [{ text: " " }] }, finishReason: "STOP" }],
+            usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+        }),
+        true
+    );
+});
+
+test("_isEmptyUpstreamResponse: unknown/OTHER finish reasons are not exempted as controls", () => {
+    const rh = makeHandler();
+    // An OTHER reason with zero content and zero tokens is still empty — do not exempt arbitrary reasons.
+    assert.strictEqual(
+        rh._isEmptyUpstreamResponse({
+            candidates: [{ content: { parts: [] }, finishReason: "OTHER" }],
+            usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+        }),
+        true
+    );
+});
+
+test("_isEmptyUpstreamResponse: OpenAI content_filter finish is NOT empty with zero tokens", () => {
+    const rh = makeHandler();
+    for (const reason of ["content_filter", "safety"]) {
+        assert.strictEqual(
+            rh._isEmptyUpstreamResponse({
+                choices: [{ finish_reason: reason, message: { content: "" } }],
+                usage: { completion_tokens: 0 },
+            }),
+            false,
+            `finish_reason ${reason} must be a valid control result`
+        );
+    }
+});
+
+// Fix 1: STREAM_END must flush a trailing partial SSE event before classifying empty, and only then
+// emit one auth-failure + SSE error (via _sendErrorChunkToClient when headers already sent).
+test("_streamClaudeResponse: true-empty STREAM_END emits one switch and one SSE error", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    let switchCount = 0;
+    let sseErrorCount = 0;
+    let jsonErrorCount = 0;
+    rh.authSwitcher = {
+        failureCount: 0,
+        handleRequestFailureAndSwitch: async () => {
+            switchCount++;
+        },
+    };
+    rh._handleAuthFailure = async () => {
+        switchCount++;
+    };
+    rh._sendErrorChunkToClient = () => {
+        sseErrorCount++;
+    };
+    rh._sendErrorResponse = () => {
+        jsonErrorCount++;
+    };
+    rh._isResponseWritable = () => true;
+    rh._translateCompleteSseEvent = () => null;
+
+    const fakeQueue = {
+        dequeue: async () => ({ type: "STREAM_END" }),
+    };
+    const res = { headersSent: true, writableEnded: false, write: () => true };
+
+    await rh._streamClaudeResponse(fakeQueue, res, "claude-3-5-sonnet", "req-claude-empty");
+
+    assert.strictEqual(switchCount, 1, "exactly one auth switch for a true-empty Claude stream");
+    assert.strictEqual(sseErrorCount, 1, "one SSE error sent when headers already sent");
+    assert.strictEqual(jsonErrorCount, 0, "no silent _sendErrorResponse no-op");
+});
+
+test("_streamClaudeResponse: fragmented final event is flushed and NOT judged empty", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    let switchCount = 0;
+    let sseErrorCount = 0;
+    const written = [];
+    rh._handleAuthFailure = async () => {
+        switchCount++;
+    };
+    rh._sendErrorChunkToClient = () => {
+        sseErrorCount++;
+    };
+    rh._sendErrorResponse = () => {};
+    rh._isResponseWritable = () => true;
+    // A fragmented final SSE event reassembles in the buffer and translates to real output.
+    rh._translateCompleteSseEvent = () => "event: content_block_delta\ndata: {}\n\n";
+    const res = {
+        headersSent: true,
+        writableEnded: false,
+        write: chunk => {
+            written.push(chunk);
+            return true;
+        },
+    };
+    // Drive the stream: first a partial chunk, then STREAM_END.
+    const partialPayload = 'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}';
+    const partialQueue = {
+        dequeue: async () => {
+            if (!partialQueue._sent) {
+                partialQueue._sent = true;
+                return { data: partialPayload, type: "chunk" };
+            }
+            return { type: "STREAM_END" };
+        },
+    };
+    await rh._streamClaudeResponse(partialQueue, res, "claude-3-5-sonnet", "req-claude-flush");
+
+    assert.strictEqual(switchCount, 0, "fragmented final event flush must NOT trigger empty judgment");
+    assert.strictEqual(sseErrorCount, 0, "no SSE error when the flush produced output");
+    assert.ok(written.length > 0, "the fragmented final event must be flushed to the client");
+});
+
+test("_streamOpenAIResponseAPIResponse: true-empty STREAM_END emits one switch and one SSE error", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    let switchCount = 0;
+    let sseErrorCount = 0;
+    let jsonErrorCount = 0;
+    rh._handleAuthFailure = async () => {
+        switchCount++;
+    };
+    rh._sendErrorChunkToClient = () => {
+        sseErrorCount++;
+    };
+    rh._sendErrorResponse = () => {
+        jsonErrorCount++;
+    };
+    rh._isResponseWritable = () => true;
+    rh._translateCompleteSseEvent = () => null;
+
+    const fakeQueue = {
+        dequeue: async () => ({ type: "STREAM_END" }),
+    };
+    const res = {
+        __responseApiSeq: null,
+        headersSent: true,
+        writableEnded: false,
+        write: () => true,
+    };
+
+    await rh._streamOpenAIResponseAPIResponse(fakeQueue, res, "gpt-5", {
+        requestId: "req-resp-empty",
+        responseDefaults: {},
+    });
+
+    assert.strictEqual(switchCount, 1, "exactly one auth switch for a true-empty Responses stream");
+    assert.strictEqual(sseErrorCount, 1, "one SSE error sent when headers already sent");
+    assert.strictEqual(jsonErrorCount, 0, "no silent _sendErrorResponse no-op");
+});
+
+test("_streamOpenAIResponse: true-empty STREAM_END emits one switch and one SSE error", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    let switchCount = 0;
+    let sseErrorCount = 0;
+    let jsonErrorCount = 0;
+    rh._handleAuthFailure = async () => {
+        switchCount++;
+    };
+    rh._sendErrorChunkToClient = () => {
+        sseErrorCount++;
+    };
+    rh._sendErrorResponse = () => {
+        jsonErrorCount++;
+    };
+    rh._isResponseWritable = () => true;
+    rh._translateCompleteSseEvent = () => null;
+
+    const fakeQueue = {
+        dequeue: async () => ({ type: "STREAM_END" }),
+    };
+    const res = { headersSent: true, writableEnded: false, write: () => true };
+
+    await rh._streamOpenAIResponse(fakeQueue, res, "gpt-4o", "req-openai-empty");
+
+    assert.strictEqual(switchCount, 1, "exactly one auth switch for a true-empty OpenAI stream");
+    assert.strictEqual(sseErrorCount, 1, "one SSE error sent when headers already sent");
+    assert.strictEqual(jsonErrorCount, 0, "no silent _sendErrorResponse no-op");
+});
+
+// Fix 3: Claude fake-stream aggregate terminal-empty must enter the existing single auth-failure + SSE error path.
+test("Claude fake stream: empty aggregate body is judged and routed to switch+retry, not translated", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    rh.config = { forceThinking: false, streamingMode: "fake", switchOnUses: 0, thinkingLevel: null };
+    rh.needsSwitchingAfterRequest = false;
+    rh.timeouts = { FAKE_STREAM: 100 };
+
+    let switched = false;
+    let errorSent = false;
+    let dumped = false;
+    let translated = false;
+
+    rh.authSwitcher = {
+        handleRequestFailureAndSwitch: async () => {
+            switched = true;
+        },
+        incrementUsageCount: () => 0,
+    };
+
+    const fakeQueue = { dequeue: async () => ({ type: "STREAM_END" }) };
+
+    rh.connectionRegistry = {
+        createMessageQueue: () => fakeQueue,
+        removeMessageQueue: () => {},
+    };
+    rh._generateRequestId = () => "test-claude-fake-empty";
+    rh._startTrackedRequest = () => {};
+    rh._setResponseApiFormat = (res, fmt) => {
+        res.__responseApiFormat = fmt;
+    };
+    rh._ensureBrowserBackedRequestReady = async () => true;
+    rh._setupClientDisconnectHandler = () => {};
+    rh._initializeProxyRequestAttempt = () => {};
+    rh._updateTrackedRequest = () => {};
+    rh._getUsageStatsService = () => null;
+    rh._executeRequestWithRetries = async () => ({ queue: fakeQueue, success: true });
+    rh._forwardRequest = async () => {};
+    rh._dumpUpstreamCorrelation = () => {
+        dumped = true;
+    };
+    rh._handleRequestError = () => {
+        errorSent = true;
+    };
+    rh._finalizeTrackedRequest = () => {};
+    rh._isResponseWritable = () => true;
+    rh._handleQueueTimeout = () => {};
+
+    rh.formatConverter.translateGoogleToClaudeStream = () => {
+        translated = true;
+    };
+    rh.formatConverter.translateClaudeToGoogle = () => ({
+        cleanModelName: "gemini-2.5-flash",
+        googleRequest: { contents: [{ parts: [{ text: "hi" }], role: "user" }] },
+        modelStreamingMode: null,
+    });
+
+    const res = {
+        end: () => {
+            res.writableEnded = true;
+        },
+        headersSent: false,
+        status: () => ({ set: () => {} }),
+        writableEnded: false,
+        write: () => true,
+    };
+    const req = {
+        body: { messages: [{ content: "hi", role: "user" }], model: "claude-3-5-sonnet", stream: true },
+        headers: {},
+        method: "POST",
+        protocol: "http",
+        url: "/v1/messages",
+    };
+
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) =>
+        ms >= 1000 ? realSetTimeout(() => {}, 0, ...args) : realSetTimeout(fn, ms, ...args);
+    try {
+        await rh.processClaudeRequest(req, res);
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+
+    assert.strictEqual(switched, true, "empty Claude fake stream must route to account switch + retry");
+    assert.strictEqual(errorSent, true, "empty Claude fake stream must send an error to the client");
+    assert.strictEqual(dumped, true, "empty Claude fake stream must write a correlation dump");
+    assert.strictEqual(
+        translated,
+        false,
+        "empty Claude fake stream must not translate/send an empty stream to the client"
+    );
+});
+
+// Fix 4: OpenAI Responses real-stream initial complete-empty chunk converts into the existing error/retry flow.
+test("Response API real stream: initial complete-empty chunk is converted to error/retry flow", async () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    rh.config = { forceThinking: false, immediateSwitchStatusCodes: [502], maxRetries: 0, streamingMode: "real" };
+    rh.timeouts = { FAKE_STREAM: 100, STREAM_CHUNK: 100 };
+
+    let switchCount = 0;
+    let forwarded = 0;
+    const rh2 = Object.create(RequestHandler.prototype);
+    Object.assign(rh2, rh);
+    rh2.authSwitcher = {
+        failureCount: 0,
+        handleRequestFailureAndSwitch: async () => {
+            switchCount++;
+        },
+        incrementUsageCount: () => 0,
+        resetEmptyJudgmentCountForAuth: () => {},
+    };
+    rh2._handleAuthFailure = async () => {
+        switchCount++;
+    };
+    rh2._withFailureAuthIndex = d => d;
+    rh2._isResponseWritable = () => true;
+    rh2._cancelCurrentAttemptBeforeRetry = () => {};
+    rh2._logFinalRequestFailure = () => {};
+    rh2._sendErrorResponse = () => {};
+    rh2._isConnectionResetError = () => false;
+    // Emulate the real immediate-switch retry: perform the account switch and continue with a new queue.
+    rh2._prepareImmediateStatusRetry = async () => {
+        await rh2._handleAuthFailure({ message: "empty", status: 502 }, "req", null, 0);
+        return true;
+    };
+    rh2._dumpUpstreamCorrelation = () => {};
+    rh2._forwardRequest = async () => {
+        forwarded++;
+    };
+    rh2._advanceProxyRequestAttempt = () => {};
+    rh2._initializeProxyRequestAttempt = () => {};
+    rh2._setupClientDisconnectHandler = () => {};
+    rh2._generateRequestId = () => "req-resp-initial-empty";
+    rh2._startTrackedRequest = () => {};
+    rh2._setResponseApiFormat = () => {};
+    rh2._updateTrackedRequest = () => {};
+    rh2._getUsageStatsService = () => null;
+    rh2._ensureBrowserBackedRequestReady = async () => true;
+    const emptyPayload = JSON.stringify({
+        candidates: [{ content: { parts: [] }, finishReason: "STOP" }],
+        usageMetadata: { candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+    });
+    const nonEmptyPayload = JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "hello" }] }, finishReason: "STOP" }],
+        usageMetadata: { candidatesTokenCount: 5, thoughtsTokenCount: 0 },
+    });
+    // First queue yields the terminal-empty initial chunk; the post-switch queue yields real content.
+    let queueCalls = 0;
+    rh2.connectionRegistry = {
+        createMessageQueue: () => ({
+            close: () => {},
+            dequeue: async () => {
+                queueCalls++;
+                if (queueCalls === 1) {
+                    return { data: emptyPayload, event_type: "chunk" };
+                }
+                if (queueCalls === 2) {
+                    return { data: nonEmptyPayload, event_type: "chunk" };
+                }
+                if (queueCalls === 3) {
+                    return { data: `data: ${nonEmptyPayload}`, event_type: "chunk" };
+                }
+                return { type: "STREAM_END" };
+            },
+        }),
+        getAuthIndexForRequest: () => 0,
+        removeMessageQueue: () => {},
+    };
+    rh2.formatConverter = {
+        translateGoogleToResponseAPIStream: (chunk, model, streamState) => {
+            // The real translator sets responseSent once it processes a candidate with content.
+            streamState.responseSent = true;
+            return "data: {}\n\n";
+        },
+        translateOpenAIResponseToGoogle: () => ({
+            cleanModelName: "gemini-2.5-flash",
+            googleRequest: {},
+            modelStreamingMode: null,
+        }),
+    };
+    rh2._finalizeTrackedRequest = () => {};
+    rh2._handleQueueTimeout = () => {};
+
+    const res = {
+        end: () => {
+            res.writableEnded = true;
+        },
+        headersSent: false,
+        status: () => ({ set: () => {} }),
+        writableEnded: false,
+        write: () => true,
+    };
+    const req = {
+        body: { input: "hi", model: "gpt-5", stream: true },
+        headers: {},
+        method: "POST",
+        protocol: "http",
+        url: "/v1/responses",
+    };
+
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) =>
+        ms >= 1000 ? realSetTimeout(() => {}, 0, ...args) : realSetTimeout(fn, ms, ...args);
+    try {
+        await rh2.processOpenAIResponseRequest(req, res);
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+
+    assert.strictEqual(switchCount, 1, "initial complete-empty chunk must trigger exactly one auth switch");
+    assert.ok(forwarded >= 2, "the request must be re-forwarded on the retry queue");
+    assert.ok(queueCalls >= 4, "retry must use a fresh queue after the switch and stream to completion");
+});
+
+// Fix 6: AuthSwitcher success reset clears the consecutive empty judgment counter for the served auth index.
+test("AuthSwitcher.resetEmptyJudgmentCountForAuth clears only the successful index", async () => {
+    const AuthSwitcher = require(path.join(__dirname, "..", "src/auth/AuthSwitcher.js"));
+    const mockBrowser = { currentAuthIndex: 0 };
+    const authSwitcher = new AuthSwitcher(
+        stubLogger,
+        { immediateSwitchStatusCodes: [502] },
+        { getAuthCount: () => 3, getCanonicalIndex: i => i },
+        mockBrowser
+    );
+    authSwitcher._emptyJudgmentCounts.set(0, 2);
+    authSwitcher._emptyJudgmentCounts.set(1, 1);
+
+    authSwitcher.resetEmptyJudgmentCountForAuth(0);
+
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.has(0), false, "successful index counter cleared");
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.get(1), 1, "other index counter preserved");
+});
+
+test("AuthSwitcher: empty xN, success, next empty restarts at 1; threshold without success still disposes", async () => {
+    const AuthSwitcher = require(path.join(__dirname, "..", "src/auth/AuthSwitcher.js"));
+    const closed = [];
+    const mockBrowser = {
+        closeContext: async index => {
+            closed.push(index);
+        },
+        currentAuthIndex: 0,
+        preCleanupForSwitch: async () => {},
+        rebalanceContextPool: async () => {},
+        switchAccount: async index => {
+            mockBrowser.currentAuthIndex = index;
+        },
+    };
+    const authSwitcher = new AuthSwitcher(
+        stubLogger,
+        { immediateSwitchStatusCodes: [502] },
+        { getAuthCount: () => 3, getCanonicalIndex: i => i, getRotationIndices: () => [0, 1] },
+        mockBrowser
+    );
+
+    // Three consecutive empties on account 0 -> threshold reached -> dispose on switch.
+    for (let i = 0; i < 3; i++) {
+        await authSwitcher.handleRequestFailureAndSwitch({ authIndex: 0, reason: "empty_upstream_response" }, null);
+    }
+    assert.strictEqual(closed.includes(0), true, "threshold of 3 empties without success disposes the context");
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.has(0), false, "counter cleared after dispose");
+
+    // Now empty x2 on account 1, then a success resets the counter, then one more empty -> starts at 1.
+    authSwitcher._emptyJudgmentCounts.set(1, 2);
+    authSwitcher.resetEmptyJudgmentCountForAuth(1);
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.has(1), false, "success resets the counter");
+    await authSwitcher.handleRequestFailureAndSwitch({ authIndex: 1, reason: "empty_upstream_response" }, null);
+    assert.strictEqual(authSwitcher._emptyJudgmentCounts.get(1), 1, "next empty after success starts counting from 1");
+});
+
+// Fix 6: shared helper routes success sites through the AuthSwitcher success reset.
+test("_resetFailureStateOnSuccess clears empty counter and failureCount via shared helper", () => {
+    const rh = makeHandler();
+    rh.logger = stubLogger;
+    let resetIndex = null;
+    rh.authSwitcher = {
+        currentAuthIndex: 5,
+        failureCount: 3,
+        resetEmptyJudgmentCountForAuth: idx => {
+            resetIndex = idx;
+        },
+    };
+    rh._resetFailureStateOnSuccess(5);
+    assert.strictEqual(resetIndex, 5, "shared helper must reset empty counter for served auth index");
+    assert.strictEqual(rh.authSwitcher.failureCount, 0, "shared helper must reset failureCount");
+});
