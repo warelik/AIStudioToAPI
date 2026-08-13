@@ -873,19 +873,47 @@ class FormatConverter {
                 thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
             }
 
+            const rawLevel = rawThinkingConfig.thinking_level ?? rawThinkingConfig.thinkingLevel;
+            if (rawLevel != null) {
+                const normalizedLevel = String(rawLevel).trim().toLowerCase();
+                const mappedLevel = FormatConverter.THINKING_LEVEL_MAP[normalizedLevel];
+                if (mappedLevel) {
+                    thinkingConfig.thinkingLevel = mappedLevel;
+                }
+            }
+
+            const rawBudget = rawThinkingConfig.thinking_budget ?? rawThinkingConfig.thinkingBudget;
+            if (rawBudget != null && typeof rawBudget === "number" && !isNaN(rawBudget)) {
+                thinkingConfig.thinkingBudget = rawBudget;
+            }
+
             this.logger.info(
                 `[Adapter] Successfully extracted and converted thinking config: ${JSON.stringify(thinkingConfig)}`
             );
         }
 
         // Handle OpenAI reasoning_effort parameter
-        if (!thinkingConfig) {
+        if (!thinkingConfig || thinkingConfig.thinkingLevel === undefined) {
             const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
-            if (effort) {
-                this.logger.debug(
-                    `[Adapter] Detected OpenAI standard reasoning parameter (reasoning_effort: ${effort}), auto-converting to Google format.`
-                );
-                thinkingConfig = { includeThoughts: true };
+            if (effort != null) {
+                const normalizedEffort = String(effort).trim().toLowerCase();
+                const mappedLevel = FormatConverter.THINKING_LEVEL_MAP[normalizedEffort];
+                if (!thinkingConfig) {
+                    thinkingConfig = { includeThoughts: true };
+                } else if (thinkingConfig.includeThoughts === undefined) {
+                    thinkingConfig.includeThoughts = true;
+                }
+
+                if (mappedLevel) {
+                    thinkingConfig.thinkingLevel = mappedLevel;
+                    this.logger.debug(
+                        `[Adapter] Detected OpenAI reasoning_effort (${normalizedEffort}), mapped thinkingLevel to ${mappedLevel}.`
+                    );
+                } else {
+                    this.logger.debug(
+                        "[Adapter] Detected OpenAI standard reasoning parameter (reasoning_effort), auto-converting to Google format."
+                    );
+                }
             }
         }
 
@@ -1739,7 +1767,7 @@ class FormatConverter {
                 const responseUsage = {
                     input_tokens: usage.prompt_tokens,
                     input_tokens_details: {
-                        cached_tokens: 0,
+                        cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
                     },
                     output_tokens: usage.completion_tokens,
                     output_tokens_details: {
@@ -2069,7 +2097,7 @@ class FormatConverter {
             usage: {
                 input_tokens: usage.prompt_tokens,
                 input_tokens_details: {
-                    cached_tokens: 0,
+                    cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
                 },
                 output_tokens: usage.completion_tokens,
                 output_tokens_details: {
@@ -2104,7 +2132,16 @@ class FormatConverter {
     }
 
     _parseUsage(googleResponse) {
-        const usage = googleResponse.usageMetadata || {};
+        const usage = googleResponse?.usageMetadata || {};
+
+        let cachedTokens = 0;
+        const rawCached = usage.cachedContentTokenCount;
+        if (typeof rawCached === "number" || typeof rawCached === "string") {
+            const parsed = Number(rawCached);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                cachedTokens = Math.floor(parsed);
+            }
+        }
 
         const inputTokens = usage.promptTokenCount || 0;
         const toolPromptTokens = usage.toolUsePromptTokenCount || 0;
@@ -2123,7 +2160,7 @@ class FormatConverter {
 
         const promptTokens = inputTokens + toolPromptTokens;
         const totalCompletionTokens = completionTextTokens + reasoningTokens;
-        const totalTokens = googleResponse.usageMetadata?.totalTokenCount || 0;
+        const totalTokens = googleResponse?.usageMetadata?.totalTokenCount || 0;
 
         return {
             completion_tokens: totalCompletionTokens,
@@ -2134,6 +2171,7 @@ class FormatConverter {
             },
             prompt_tokens: promptTokens,
             prompt_tokens_details: {
+                cached_tokens: cachedTokens,
                 text_tokens: inputTokens,
                 tool_tokens: toolPromptTokens,
             },

@@ -147,3 +147,411 @@ test("convertGoogleToOpenAINonStream preserves a functionCall part that carries 
     assert.ok(Array.isArray(toolCalls) && toolCalls.length === 1, JSON.stringify(out.choices[0].message));
     assert.strictEqual(toolCalls[0].function.name, "get_weather");
 });
+
+// ---- OpenAI reasoning_effort fidelity and precedence ----
+test("translateOpenAIToGoogle maps reasoning_effort to thinkingLevel via THINKING_LEVEL_MAP", async () => {
+    const fc = makeConverter();
+    const cases = [
+        { effort: "minimal", expected: "MINIMAL" },
+        { effort: "low", expected: "LOW" },
+        { effort: "medium", expected: "MEDIUM" },
+        { effort: "high", expected: "HIGH" },
+        { effort: "MEDIUM", expected: "MEDIUM" },
+        { effort: "  LoW  ", expected: "LOW" },
+    ];
+
+    for (const { effort, expected } of cases) {
+        const body = {
+            messages: [{ content: "hi", role: "user" }],
+            model: "gemini-2.5-flash",
+            reasoning_effort: effort,
+        };
+        const { googleRequest } = await fc.translateOpenAIToGoogle(body);
+        assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+            includeThoughts: true,
+            thinkingLevel: expected,
+        });
+    }
+});
+
+test("translateOpenAIToGoogle preserves model suffix precedence over body reasoning_effort", async () => {
+    const fc = makeConverter();
+    const body = {
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-pro:thinking-high",
+        reasoning_effort: "low",
+    };
+    const { googleRequest } = await fc.translateOpenAIToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingLevel: "HIGH",
+    });
+});
+
+test("translateOpenAIToGoogle preserves native extra_body.google thinking_config precedence over reasoning_effort", async () => {
+    const fc = makeConverter();
+    const body = {
+        extra_body: {
+            google: {
+                thinking_config: {
+                    include_thoughts: true,
+                    thinking_level: "HIGH",
+                },
+            },
+        },
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+        reasoning_effort: "low",
+    };
+    const { googleRequest } = await fc.translateOpenAIToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingLevel: "HIGH",
+    });
+});
+
+test("translateOpenAIToGoogle supports camelCase native thinkingConfig and thinkingBudget", async () => {
+    const fc = makeConverter();
+    const body = {
+        extra_body: {
+            google: {
+                thinkingConfig: {
+                    includeThoughts: true,
+                    thinkingBudget: 1024,
+                    thinkingLevel: "LOW",
+                },
+            },
+        },
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+    };
+    const { googleRequest } = await fc.translateOpenAIToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingBudget: 1024,
+        thinkingLevel: "LOW",
+    });
+});
+
+test("translateOpenAIToGoogle body reasoning_effort fills missing native level without overwriting explicit level", async () => {
+    const fc = makeConverter();
+
+    // Missing native level -> body reasoning_effort fills it
+    const bodyFill = {
+        extra_body: {
+            google: {
+                thinking_config: {
+                    include_thoughts: true,
+                },
+            },
+        },
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+        reasoning_effort: "high",
+    };
+    const { googleRequest: reqFill } = await fc.translateOpenAIToGoogle(bodyFill);
+    assert.deepStrictEqual(reqFill.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingLevel: "HIGH",
+    });
+
+    // Explicit native level -> body reasoning_effort ignored
+    const bodyNoOverwrite = {
+        extra_body: {
+            google: {
+                thinking_config: {
+                    include_thoughts: true,
+                    thinking_level: "HIGH",
+                },
+            },
+        },
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+        reasoning_effort: "low",
+    };
+    const { googleRequest: reqNoOverwrite } = await fc.translateOpenAIToGoogle(bodyNoOverwrite);
+    assert.deepStrictEqual(reqNoOverwrite.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+        thinkingLevel: "HIGH",
+    });
+});
+
+test("translateOpenAIToGoogle preserves explicit include_thoughts:false and native thinking_level over reasoning_effort", async () => {
+    const fc = makeConverter();
+    const body = {
+        extra_body: {
+            google: {
+                thinking_config: {
+                    include_thoughts: false,
+                    thinking_level: "LOW",
+                },
+            },
+        },
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+        reasoning_effort: "high",
+    };
+    const { googleRequest } = await fc.translateOpenAIToGoogle(body);
+    assert.deepStrictEqual(googleRequest.generationConfig.thinkingConfig, {
+        includeThoughts: false,
+        thinkingLevel: "LOW",
+    });
+});
+
+test("translateOpenAIToGoogle fallback for unknown reasoning_effort or missing reasoning_effort", async () => {
+    const fc = makeConverter();
+
+    // Unknown effort -> includeThoughts: true, no invalid thinkingLevel
+    const unknownBody = {
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+        reasoning_effort: "custom_unknown",
+    };
+    const { googleRequest: reqUnknown } = await fc.translateOpenAIToGoogle(unknownBody);
+    assert.deepStrictEqual(reqUnknown.generationConfig.thinkingConfig, {
+        includeThoughts: true,
+    });
+
+    // No effort -> no thinkingConfig set
+    const noEffortBody = {
+        messages: [{ content: "hi", role: "user" }],
+        model: "gemini-2.5-flash",
+    };
+    const { googleRequest: reqNoEffort } = await fc.translateOpenAIToGoogle(noEffortBody);
+    assert.strictEqual(reqNoEffort.generationConfig.thinkingConfig, undefined);
+});
+
+test("FormatConverter._parseUsage handles cachedContentTokenCount and coexistence with reasoning tokens", () => {
+    const fc = makeConverter();
+    const cases = [
+        {
+            expected: {
+                completion_tokens: 50,
+                completion_tokens_details: { image_tokens: 0, output_text_tokens: 50, reasoning_tokens: 0 },
+                prompt_tokens: 100,
+                prompt_tokens_details: { cached_tokens: 40, text_tokens: 100, tool_tokens: 0 },
+                total_tokens: 150,
+            },
+            input: {
+                cachedContentTokenCount: 40,
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "1. nonzero cachedContentTokenCount",
+        },
+        {
+            expected: {
+                completion_tokens: 50,
+                completion_tokens_details: { image_tokens: 0, output_text_tokens: 50, reasoning_tokens: 0 },
+                prompt_tokens: 100,
+                prompt_tokens_details: { cached_tokens: 0, text_tokens: 100, tool_tokens: 0 },
+                total_tokens: 150,
+            },
+            input: {
+                cachedContentTokenCount: 0,
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "2. zero cachedContentTokenCount",
+        },
+        {
+            expected: {
+                completion_tokens: 50,
+                completion_tokens_details: { image_tokens: 0, output_text_tokens: 50, reasoning_tokens: 0 },
+                prompt_tokens: 100,
+                prompt_tokens_details: { cached_tokens: 0, text_tokens: 100, tool_tokens: 0 },
+                total_tokens: 150,
+            },
+            input: { candidatesTokenCount: 50, promptTokenCount: 100, totalTokenCount: 150 },
+            name: "3. absent cachedContentTokenCount",
+        },
+        {
+            expectedCached: 40,
+            input: {
+                cachedContentTokenCount: "40",
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "4a. string numeric cachedContentTokenCount",
+        },
+        {
+            expectedCached: 0,
+            input: {
+                cachedContentTokenCount: "invalid",
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "4b. malformed string cachedContentTokenCount",
+        },
+        {
+            expectedCached: 0,
+            input: {
+                cachedContentTokenCount: -10,
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "4c. negative cachedContentTokenCount",
+        },
+        {
+            expectedCached: 0,
+            input: {
+                cachedContentTokenCount: NaN,
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "4d. NaN / Infinity cachedContentTokenCount",
+        },
+        {
+            expectedCached: 0,
+            input: {
+                cachedContentTokenCount: true,
+                candidatesTokenCount: 50,
+                promptTokenCount: 100,
+                totalTokenCount: 150,
+            },
+            name: "4e. boolean / object cachedContentTokenCount",
+        },
+        {
+            expected: {
+                completion_tokens: 110,
+                completion_tokens_details: { image_tokens: 0, output_text_tokens: 80, reasoning_tokens: 30 },
+                prompt_tokens: 200,
+                prompt_tokens_details: { cached_tokens: 50, text_tokens: 200, tool_tokens: 0 },
+                total_tokens: 310,
+            },
+            input: {
+                cachedContentTokenCount: 50,
+                candidatesTokenCount: 80,
+                promptTokenCount: 200,
+                thoughtsTokenCount: 30,
+                totalTokenCount: 310,
+            },
+            name: "5 & 6. cached tokens coexisting with reasoning tokens without affecting totals",
+        },
+    ];
+
+    for (const c of cases) {
+        const result = fc._parseUsage({ usageMetadata: c.input });
+        if (c.expected) {
+            assert.deepStrictEqual(result, c.expected, `failed on ${c.name}`);
+        } else if (c.expectedCached !== undefined) {
+            assert.strictEqual(result.prompt_tokens_details.cached_tokens, c.expectedCached, `failed on ${c.name}`);
+            assert.strictEqual(result.prompt_tokens, 100, `prompt_tokens changed on ${c.name}`);
+            assert.strictEqual(result.total_tokens, 150, `total_tokens changed on ${c.name}`);
+        }
+    }
+});
+
+test("convertGoogleToOpenAINonStream includes cached_tokens in usage.prompt_tokens_details", () => {
+    const fc = makeConverter();
+    const googleResponse = {
+        candidates: [{ content: { parts: [{ text: "Hello" }] }, finishReason: "STOP" }],
+        usageMetadata: {
+            cachedContentTokenCount: 8,
+            candidatesTokenCount: 5,
+            promptTokenCount: 10,
+            totalTokenCount: 15,
+        },
+    };
+    const res = fc.convertGoogleToOpenAINonStream(googleResponse, "gemini-2.5-flash");
+    assert.deepStrictEqual(res.usage, {
+        completion_tokens: 5,
+        completion_tokens_details: { image_tokens: 0, output_text_tokens: 5, reasoning_tokens: 0 },
+        prompt_tokens: 10,
+        prompt_tokens_details: { cached_tokens: 8, text_tokens: 10, tool_tokens: 0 },
+        total_tokens: 15,
+    });
+});
+
+test("translateGoogleToOpenAIStream includes cached_tokens in usage chunk", () => {
+    const fc = makeConverter();
+    const chunk = JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "Hi" }] }, finishReason: "STOP" }],
+        usageMetadata: {
+            cachedContentTokenCount: 6,
+            candidatesTokenCount: 4,
+            promptTokenCount: 12,
+            totalTokenCount: 16,
+        },
+    });
+    const streamState = {};
+    const out = fc.translateGoogleToOpenAIStream(chunk, "gemini-2.5-flash", streamState);
+    assert.strictEqual(streamState.usage.prompt_tokens_details.cached_tokens, 6);
+    assert.strictEqual(streamState.usage.prompt_tokens, 12);
+    assert.ok(out.includes('"cached_tokens":6'), "stream chunk string should include cached_tokens:6");
+});
+
+test("convertGoogleToResponseAPINonStream includes cached_tokens under input_tokens_details", () => {
+    const fc = makeConverter();
+    const googleResponse = {
+        candidates: [{ content: { parts: [{ text: "Resp" }] }, finishReason: "STOP" }],
+        usageMetadata: {
+            cachedContentTokenCount: 15,
+            candidatesTokenCount: 10,
+            promptTokenCount: 20,
+            totalTokenCount: 30,
+        },
+    };
+    const res = fc.convertGoogleToResponseAPINonStream(googleResponse, "gemini-2.5-flash");
+    assert.deepStrictEqual(res.usage, {
+        input_tokens: 20,
+        input_tokens_details: { cached_tokens: 15 },
+        output_tokens: 10,
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 30,
+    });
+});
+
+test("translateGoogleToResponseAPIStream includes cached_tokens under input_tokens_details", () => {
+    const fc = makeConverter();
+    const streamState = {};
+    const googleChunk = JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "Resp" }] }, finishReason: "STOP" }],
+        usageMetadata: {
+            cachedContentTokenCount: 18,
+            candidatesTokenCount: 12,
+            promptTokenCount: 25,
+            totalTokenCount: 37,
+        },
+    });
+    const result = fc.translateGoogleToResponseAPIStream(googleChunk, "gemini-2.5-flash", streamState);
+    assert.ok(result, "should return stream data");
+    assert.strictEqual(streamState.usage.prompt_tokens_details.cached_tokens, 18);
+    assert.ok(result.includes('"cached_tokens":18'), "stream output string should include cached_tokens:18");
+});
+
+test("usage outputs do not include invented Claude or prompt-cache resource fields", () => {
+    const fc = makeConverter();
+    const googleResponse = {
+        candidates: [{ content: { parts: [{ text: "Test" }] }, finishReason: "STOP" }],
+        usageMetadata: {
+            cachedContentTokenCount: 7,
+            candidatesTokenCount: 5,
+            promptTokenCount: 10,
+            totalTokenCount: 15,
+        },
+    };
+    const chatRes = fc.convertGoogleToOpenAINonStream(googleResponse, "gemini-2.5-flash");
+    const respRes = fc.convertGoogleToResponseAPINonStream(googleResponse, "gemini-2.5-flash");
+
+    const forbiddenFields = [
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "prompt_cache_key",
+        "cache_key",
+        "cache_creation_tokens",
+    ];
+
+    for (const field of forbiddenFields) {
+        assert.strictEqual(chatRes.usage[field], undefined);
+        assert.strictEqual(chatRes.usage.prompt_tokens_details[field], undefined);
+        assert.strictEqual(respRes.usage[field], undefined);
+        assert.strictEqual(respRes.usage.input_tokens_details[field], undefined);
+    }
+});
